@@ -441,6 +441,11 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
             for column in required:
                 if column not in frame:
                     frame[column] = None
+            # RSS feeds commonly use RFC 2822 dates (for example, "Fri, 10 Jul
+            # 2026 17:19:00 GMT"). Normalize every source timestamp before the
+            # DuckDB insert so source-specific date formats never break a run.
+            for column in ["published_at", "fetched_at"]:
+                frame[column] = pd.to_datetime(frame[column], errors="coerce", utc=True).dt.tz_convert(None)
             frame["snapshot_hash"] = packet_hash
             conn.register("_lab_evidence", frame[["evidence_id", "snapshot_hash", *required[1:]]])
             conn.execute("INSERT OR IGNORE INTO lab_evidence SELECT * FROM _lab_evidence")

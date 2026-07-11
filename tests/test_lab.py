@@ -76,7 +76,7 @@ def test_research_details_persist_source_level_evidence(tmp_path):
     packet = {
         "as_of_date": "2026-07-01", "candidates": [], "security_master": [],
         "candidate_scores": [{"symbol": "NVDA", "technical_score": 90, "fundamental_score": 80, "combined_score": 86, "liquidity_score": 90, "sector": "Tech", "score_json": "{}"}],
-        "evidence": [{"evidence_id": "e1", "symbol": "NVDA", "category": "news", "title": "Test", "summary": "Test", "source_url": "https://example.com", "publisher": "Test", "published_at": "2026-07-01", "fetched_at": "2026-07-01", "content_hash": "x", "status": "available"}],
+        "evidence": [{"evidence_id": "e1", "symbol": "NVDA", "category": "news", "title": "Test", "summary": "Test", "source_url": "https://example.com", "publisher": "Test", "published_at": "Fri, 10 Jul 2026 17:19:00 GMT", "fetched_at": "2026-07-01", "content_hash": "x", "status": "available"}],
     }
     packet_hash = save_lab_research_snapshot(packet, db_path)
     save_lab_research_details(packet_hash, packet, db_path)
