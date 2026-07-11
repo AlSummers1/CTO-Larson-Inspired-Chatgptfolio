@@ -9,7 +9,7 @@ It is informational only. It does not place trades, does not connect to a broker
 The `Chatgptfolio Lab` dashboard view adds an auditable paper-trading workflow using OpenAI Responses API models. It is an experimental research tool, not investment advice and it never contacts a broker.
 
 - Default decision model: `gpt-5.5`; selectable alternatives: `gpt-5.4`, `gpt-5.4-mini`.
-- Set `OPENAI_API_KEY` in your environment before running a model analysis. The application never writes API keys to DuckDB, logs, snapshots, or source control.
+- Set `OPENAI_API_KEY` in your environment before running a model analysis. On macOS, the app also automatically reads a Keychain entry named `chatgptfolio-openai` for the current user. The application never writes API keys to DuckDB, logs, snapshots, or source control.
 - Research packets, model configuration, raw structured responses, validation results, evidence, factor scores, and paper orders are persisted locally for audit.
 - The weekly research packet can enrich technical candidates with bounded, timestamped SEC/EDGAR filings and facts, FRED macro observations, and curated news RSS. Missing or failed sources remain explicit; the model is instructed to abstain rather than fabricate evidence.
 - Model outputs express conviction and underwriting only. A deterministic allocator applies the holding, position, sector, turnover, and cash constraints before any paper order can be approved.

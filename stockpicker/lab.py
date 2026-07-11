@@ -6,9 +6,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
+import getpass
 import hashlib
 import json
 import os
+import platform
+import subprocess
 from typing import Any
 
 import pandas as pd
@@ -149,13 +152,14 @@ class OpenAIPortfolioModel:
         self.model = model
 
     def decide(self, packet: dict[str, object], config: LabConfig) -> tuple[dict[str, object], str, str]:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY is not configured. Add it to your environment; it is never stored by Chatgptfolio.")
+        api_key = openai_api_key()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured and no Chatgptfolio key was found in macOS Keychain. Add it to your environment or save it with: security add-generic-password -a \"$USER\" -s chatgptfolio-openai -w")
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError("Install dependencies with: pip install -r requirements.txt") from exc
-        client = OpenAI()
+        client = OpenAI(api_key=api_key)
         response = client.responses.create(
             model=self.model,
             input=prompt_for_packet(packet, config),
@@ -166,6 +170,30 @@ class OpenAIPortfolioModel:
         decision = json.loads(raw)
         returned_model = getattr(response, "model", self.model)
         return decision, raw, returned_model
+
+
+def openai_api_key() -> str | None:
+    """Resolve an API key without persisting or logging it.
+
+    Environment configuration has priority. On macOS, a local-only installation
+    may instead keep the key in the user's Keychain under ``chatgptfolio-openai``.
+    """
+    environment_key = os.getenv("OPENAI_API_KEY")
+    if environment_key:
+        return environment_key
+    if platform.system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", getpass.getuser(), "-s", "chatgptfolio-openai", "-w"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
 def optimize_decision(

@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 
 from stockpicker.data import load_lab_runs, save_lab_research_details, save_lab_research_snapshot, save_lab_run
-from stockpicker.lab import LabConfig, optimize_decision, paper_orders, research_packet, validate_decision
+from stockpicker.lab import LabConfig, openai_api_key, optimize_decision, paper_orders, research_packet, validate_decision
 
 
 def _candidates():
@@ -84,3 +84,21 @@ def test_research_details_persist_source_level_evidence(tmp_path):
     with duckdb.connect(str(db_path), read_only=True) as conn:
         assert conn.execute("SELECT count(*) FROM lab_evidence").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM lab_factor_scores").fetchone()[0] == 1
+
+
+def test_openai_key_prefers_environment_over_keychain(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
+    assert openai_api_key() == "environment-key"
+
+
+def test_openai_key_reads_macos_keychain_when_environment_is_missing(monkeypatch):
+    import stockpicker.lab as lab
+
+    class Result:
+        returncode = 0
+        stdout = "keychain-key\n"
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(lab.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(lab.subprocess, "run", lambda *args, **kwargs: Result())
+    assert openai_api_key() == "keychain-key"
