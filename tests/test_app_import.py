@@ -184,6 +184,17 @@ def test_seed_symbol_helpers_use_selected_seed_frames():
     assert symbols == symbol_map["Healthcare Universe"]
 
 
+def test_all_seed_universe_deduplicates_and_preserves_memberships():
+    app = importlib.import_module("app")
+    seed_frames = {
+        "Seed A": pd.DataFrame([{"symbol": "AAA", "name": "A", "theme": "Theme", "fundamental_score": 0, "catalyst_score": 0, "notes": ""}, {"symbol": "B", "name": "B", "theme": "Theme", "fundamental_score": 0, "catalyst_score": 0, "notes": ""}]),
+        "Seed B": pd.DataFrame([{"symbol": "AAA", "name": "A", "theme": "Theme", "fundamental_score": 0, "catalyst_score": 0, "notes": ""}]),
+    }
+    union = app.all_seed_universe(seed_frames)
+    assert union["symbol"].tolist() == ["AAA", "B"]
+    assert union.loc[union["symbol"] == "AAA", "seed_memberships"].iloc[0] == "Seed A · Seed B"
+
+
 def test_rrg_seed_labels_for_fetch_only_when_seed_view_active():
     app = importlib.import_module("app")
 

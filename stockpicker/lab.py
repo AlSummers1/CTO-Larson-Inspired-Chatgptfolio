@@ -21,6 +21,8 @@ from .research import fetch_macro_snapshot, fetch_news, fetch_sec_company_resear
 MODEL_OPTIONS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 DEFAULT_MODEL = "gpt-5.5"
 PROMPT_VERSION = "chatgptfolio-v2-research-lab"
+SEVERITY_ORDER = ("critical", "high", "medium", "low", "unresolved")
+SEVERITY_COLORS = {"critical": "#dc2626", "high": "#f97316", "medium": "#eab308", "low": "#22c55e", "unresolved": "#94a3b8"}
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,7 @@ def research_packet(
 def prompt_for_packet(packet: dict[str, object], config: LabConfig) -> str:
     return f"""You are Chatgptfolio's research underwriter. Use ONLY the timestamped research packet below. Do not invent news, fundamentals, prices, citations, targets, or events. This is paper-trading research, not investment advice. Prefer abstaining when evidence is insufficient.
 
-Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Explain downside triggers and bull/base/bear valuation scenarios. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
+Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Explain downside triggers and bull/base/bear valuation scenarios. Classify every investment risk as critical, high, medium, low, or unresolved and cite packet evidence for it. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
 
 Return JSON matching the requested schema.
 
@@ -139,10 +141,31 @@ DECISION_SCHEMA: dict[str, Any] = {
     "properties": {
         "abstain_reason": {"type": ["string", "null"]},
         "portfolio_thesis": {"type": "string"},
+        "portfolio_risks": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"category": {"type": "string"}, "severity": {"type": "string", "enum": list(SEVERITY_ORDER)}, "rationale": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["category", "severity", "rationale", "evidence_refs"]}},
         "cash_target": {"type": "number", "minimum": 0, "maximum": 0.5},
-        "holdings": {"type": "array", "maxItems": 15, "items": {"type": "object", "additionalProperties": False, "properties": {"symbol": {"type": "string"}, "score": {"type": "number", "minimum": 0, "maximum": 100}, "confidence": {"type": "number", "minimum": 0, "maximum": 100}, "conviction": {"type": "number", "minimum": 0, "maximum": 100}, "thesis": {"type": "string"}, "catalysts": {"type": "array", "items": {"type": "string"}}, "risks": {"type": "array", "items": {"type": "string"}}, "downside_triggers": {"type": "array", "items": {"type": "string"}}, "scenarios": {"type": "object", "additionalProperties": False, "properties": {"bear": {"type": "string"}, "base": {"type": "string"}, "bull": {"type": "string"}}, "required": ["bear", "base", "bull"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["symbol", "score", "confidence", "conviction", "thesis", "catalysts", "risks", "downside_triggers", "scenarios", "evidence_refs"]}},
-    }, "required": ["abstain_reason", "portfolio_thesis", "cash_target", "holdings"],
+        "holdings": {"type": "array", "maxItems": 15, "items": {"type": "object", "additionalProperties": False, "properties": {"symbol": {"type": "string"}, "score": {"type": "number", "minimum": 0, "maximum": 100}, "confidence": {"type": "number", "minimum": 0, "maximum": 100}, "conviction": {"type": "number", "minimum": 0, "maximum": 100}, "thesis": {"type": "string"}, "catalysts": {"type": "array", "items": {"type": "string"}}, "risks": {"type": "array", "items": {"type": "string"}}, "risk_flags": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"category": {"type": "string"}, "severity": {"type": "string", "enum": list(SEVERITY_ORDER)}, "rationale": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["category", "severity", "rationale", "evidence_refs"]}}, "downside_triggers": {"type": "array", "items": {"type": "string"}}, "scenarios": {"type": "object", "additionalProperties": False, "properties": {"bear": {"type": "string"}, "base": {"type": "string"}, "bull": {"type": "string"}}, "required": ["bear", "base", "bull"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["symbol", "score", "confidence", "conviction", "thesis", "catalysts", "risks", "risk_flags", "downside_triggers", "scenarios", "evidence_refs"]}},
+    }, "required": ["abstain_reason", "portfolio_thesis", "portfolio_risks", "cash_target", "holdings"],
 }
+
+
+def evidence_health(packet: dict[str, object]) -> list[dict[str, str]]:
+    """Classify evidence completeness deterministically for the UI and audit trail."""
+    coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
+    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "Curated news"}
+    output = []
+    for key, label in labels.items():
+        status = str(coverage.get(key, "unresolved"))
+        if key == "prices" and status != "available": severity = "critical"
+        elif status == "unavailable": severity = "critical" if key in {"fundamentals", "events"} else "high"
+        elif status == "not_requested": severity = "unresolved"
+        elif status == "available": severity = "low"
+        else: severity = "medium"
+        output.append({"source": label, "status": status, "severity": severity})
+    return output
+
+
+def severity_counts(items: list[dict[str, object]]) -> dict[str, int]:
+    return {severity: sum(1 for item in items if item.get("severity") == severity) for severity in SEVERITY_ORDER}
 
 
 class OpenAIPortfolioModel:
@@ -264,7 +287,7 @@ def optimize_decision(
     return output
 
 
-def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, config: LabConfig, previous: pd.DataFrame | None = None) -> ValidationResult:
+def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, config: LabConfig, previous: pd.DataFrame | None = None, packet: dict[str, object] | None = None) -> ValidationResult:
     errors: list[str] = []
     holdings = decision.get("holdings", [])
     if not isinstance(holdings, list):
@@ -296,6 +319,21 @@ def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, con
         turnover = sum(abs(float(old.get(symbol, 0)) - float(new.get(symbol, 0))) for symbol in set(old) | set(new)) / 2
         if turnover > config.max_turnover + 1e-8:
             errors.append("turnover violates limit")
+    if packet is not None:
+        evidence_ids = {str(item.get("evidence_id")) for item in packet.get("evidence", []) if isinstance(item, dict)}
+        flags = list(decision.get("portfolio_risks", []))
+        for item in holdings:
+            if isinstance(item, dict):
+                flags.extend(item.get("risk_flags", []))
+        for flag in flags:
+            if not isinstance(flag, dict):
+                errors.append("risk flag must be an object")
+                continue
+            if flag.get("severity") not in SEVERITY_ORDER:
+                errors.append("risk flag has invalid severity")
+            refs = {str(ref) for ref in flag.get("evidence_refs", [])}
+            if refs and not refs.issubset(evidence_ids):
+                errors.append("risk flag references evidence outside the research packet")
     return ValidationResult(not errors, errors)
 
 

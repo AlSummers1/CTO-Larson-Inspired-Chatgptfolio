@@ -28,7 +28,6 @@ from stockpicker.portfolio import (
     SENSITIVITY_PROFILES,
     allocate_portfolio,
     apply_sensitivity_to_target,
-    build_allocator_prompt,
     build_portfolio_candidates,
     compare_portfolios,
     canonical_selected_seeds,
@@ -55,11 +54,15 @@ from stockpicker.lab import (
     MODEL_OPTIONS,
     LabConfig,
     OpenAIPortfolioModel,
+    SEVERITY_COLORS,
+    SEVERITY_ORDER,
     config_payload as lab_config_payload,
     decision_hash,
+    evidence_health,
     paper_orders,
     optimize_decision,
     research_packet,
+    severity_counts,
     validate_decision,
 )
 
@@ -298,6 +301,29 @@ def seed_membership_frame(seed_frames: dict[str, pd.DataFrame], labels: list[str
     if not frames:
         return pd.DataFrame(columns=[*UNIVERSE_COLUMNS, "seed_universe"])
     return pd.concat(frames, ignore_index=True)
+
+
+def all_seed_universe(seed_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Return one row per ticker while retaining every seed membership."""
+    membership = seed_membership_frame(seed_frames, list(seed_frames))
+    if membership.empty:
+        return empty_universe().assign(seed_memberships=pd.Series(dtype=str))
+    membership["symbol"] = membership["symbol"].astype(str).str.upper()
+    rows = []
+    for symbol, group in membership.groupby("symbol", sort=True):
+        first = group.iloc[0].to_dict()
+        first["symbol"] = symbol
+        first["seed_memberships"] = " · ".join(sorted(group["seed_universe"].dropna().unique()))
+        first["theme"] = first["seed_memberships"]
+        rows.append(first)
+    return pd.DataFrame(rows)[[*UNIVERSE_COLUMNS, "seed_memberships"]]
+
+
+def severity_dot_strip(items: list[dict[str, object]], label: str) -> None:
+    counts = severity_counts(items)
+    dots = " ".join(f"<span style='color:{SEVERITY_COLORS[level]};font-size:1.35rem'>●</span>" * counts[level] for level in SEVERITY_ORDER)
+    summary = " · ".join(f"{counts[level]} {level}" for level in SEVERITY_ORDER if counts[level]) or "No findings"
+    st.markdown(f"**{label}:** {dots}<br><small>{summary}</small>", unsafe_allow_html=True)
 
 
 def seed_text_mode(seed_label: str, seed: pd.DataFrame) -> str:
@@ -1024,7 +1050,10 @@ def main() -> None:
     )
     rrg_seed_symbols = seed_symbols_for_labels(seed_frames, rrg_seed_labels)
     portfolio_seed_symbols = seed_symbols_for_labels(seed_frames, portfolio_seed_labels_for_fetch)
-    symbols = sorted(set(universe["symbol"]).union(rrg_seed_symbols).union(portfolio_seed_symbols).union({benchmark}))
+    all_seed = all_seed_universe(seed_frames)
+    lab_uses_all_seeds = st.session_state.get("dashboard_view") == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
+    lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
+    symbols = sorted(set(universe["symbol"]).union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union({benchmark}))
     refresh_key = st.session_state.get("refresh_key", 0)
     if refresh_clicked:
         refresh_key += 1
@@ -1535,20 +1564,6 @@ def main() -> None:
                         candidate_display[column] = candidate_display[column] * 100
                 st.dataframe(candidate_display, width="stretch", hide_index=True)
 
-            st.subheader("LLM Prompt Preview")
-            st.code(
-                build_allocator_prompt(
-                    previous_portfolio,
-                    applied_target,
-                    changes,
-                    suppressed,
-                    benchmark,
-                    benchmark_regime,
-                    portfolio_config,
-                ),
-                language="json",
-            )
-
             with st.expander("Saved Rebalance Log"):
                 show_all_logs = st.checkbox("Show all saved rebalance logs", value=False)
                 matching_snapshot_id = previous_metadata.get("snapshot_id") if previous_metadata else None
@@ -1564,7 +1579,25 @@ def main() -> None:
     elif active_view == "Chatgptfolio Lab":
         st.title("Chatgptfolio Lab")
         st.caption("Auditable OpenAI research and paper trading. This does not place real trades or provide investment advice.")
-        lab_candidates = ranked.head(30).copy()
+        lab_candidate_universe = st.radio("Candidate universe", ["All seed tickers", "Current selected seed"], horizontal=True, key="lab_candidate_universe", help="All seed tickers technically ranks the deduplicated union before research is bounded to the top 30.")
+        lab_universe = all_seed if lab_candidate_universe == "All seed tickers" else universe
+        lab_signal_prices = prices_for_symbols(prices, set(lab_universe["symbol"]).union({benchmark}))
+        lab_signals = cached_signal_table(lab_signal_prices, benchmark, larsson_history_weeks)
+        lab_signals = lab_signals.merge(lab_universe, on="symbol", how="left")
+        for column in ["name", "theme", "notes"]:
+            if column in lab_signals:
+                lab_signals[column] = lab_signals[column].fillna("")
+        for column in ["fundamental_score", "catalyst_score"]:
+            if column in lab_signals:
+                lab_signals[column] = lab_signals[column].fillna(0.0)
+        lab_ranked = rank_universe(lab_signals, RankingConfig(use_relative_strength=use_relative_strength))
+        if require_200d:
+            lab_ranked = lab_ranked[lab_ranked["pass_200d"] == True].copy()
+        if require_200w:
+            lab_ranked = lab_ranked[lab_ranked["pass_200w"] == True].copy()
+        lab_ranked = lab_ranked.reset_index(drop=True)
+        lab_ranked["rank"] = range(1, len(lab_ranked) + 1)
+        lab_candidates = lab_ranked.head(30).copy()
         lab_state = st.session_state.get("lab_state", {})
 
         st.subheader("1. Run setup")
@@ -1584,17 +1617,32 @@ def main() -> None:
 
         st.subheader("2. Research packet")
         packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False)
+        display_packet = lab_state.get("packet", packet)
         source_status, coverage_status, candidate_status = st.columns(3)
-        source_status.metric("Price source", "Available")
+        source_status.metric("Price source", display_packet["coverage"]["prices"].title())
         coverage_status.metric("Research completeness", "Ready to refresh" if refresh_research else "Cached prices only")
         candidate_status.metric("Candidates", len(lab_candidates))
-        st.caption("Weekly research uses timestamped SEC/EDGAR, FRED, and curated-news evidence when refreshed. Missing sources remain visible and are never filled by model inference.")
-        with st.expander("Inspect immutable research packet"):
-            st.json(packet)
+        st.caption(f"{len(lab_ranked)} technically eligible tickers were ranked; only the top {len(lab_candidates)} enter the bounded research packet. Missing sources remain explicit and are never filled by model inference.")
+        st.subheader("Research Overview")
+        health = evidence_health(display_packet)
+        severity_dot_strip(health, "Evidence health")
+        st.dataframe(pd.DataFrame(health), width="stretch", hide_index=True)
+        macro = display_packet.get("macro", {})
+        if macro.get("series"):
+            st.caption(f"Macro regime: **{macro.get('regime', 'unavailable')}**")
+            st.dataframe(pd.DataFrame(macro["series"]).T, width="stretch", hide_index=False)
+        with st.expander("Immutable packet audit (raw JSON)"):
+            st.json(display_packet)
 
         st.subheader("3. Candidate review")
-        review_columns = [column for column in ["symbol", "name", "theme", "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score", "larsson_regime", "daily_trend", "weekly_trend", "monthly_trend", "data_warnings"] if column in lab_candidates]
-        st.dataframe(lab_candidates[review_columns], width="stretch", hide_index=True)
+        review = lab_ranked.copy()
+        if "seed_memberships" in review:
+            membership_options = sorted({seed for value in review["seed_memberships"].dropna() for seed in str(value).split(" · ")})
+            membership_filter = st.multiselect("Filter all-seeds review by membership", membership_options)
+            if membership_filter:
+                review = review[review["seed_memberships"].map(lambda value: bool(set(str(value).split(" · ")).intersection(membership_filter)))]
+        review_columns = [column for column in ["rank", "symbol", "name", "seed_memberships", "theme", "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score", "larsson_regime", "daily_trend", "weekly_trend", "monthly_trend", "data_warnings"] if column in review]
+        st.dataframe(review[review_columns], width="stretch", hide_index=True)
 
         if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
             packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research)
@@ -1603,7 +1651,7 @@ def main() -> None:
             try:
                 model_decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
                 decision = optimize_decision(model_decision, lab_candidates, lab_config)
-                validation = validate_decision(decision, lab_candidates, lab_config)
+                validation = validate_decision(decision, lab_candidates, lab_config, packet=packet)
                 status = "proposal_ready" if validation.valid else "validation_failed"
                 run_id = save_lab_run({
                     "as_of_date": as_of_date,
@@ -1649,6 +1697,34 @@ def main() -> None:
                 st.info("No holdings proposed.")
             else:
                 st.dataframe(proposal, width="stretch", hide_index=True)
+
+            risk_items = []
+            for flag in decision.get("portfolio_risks", []):
+                if isinstance(flag, dict):
+                    risk_items.append({"symbol": "Portfolio", **flag})
+            for holding in decision.get("holdings", []):
+                if isinstance(holding, dict):
+                    for flag in holding.get("risk_flags", []):
+                        if isinstance(flag, dict):
+                            risk_items.append({"symbol": holding.get("symbol", ""), **flag})
+            st.subheader("Investment risk")
+            severity_dot_strip(risk_items, "Model-assessed risks")
+            if risk_items:
+                st.dataframe(pd.DataFrame(risk_items), width="stretch", hide_index=True)
+            else:
+                st.info("No model risk flags were returned for this run.")
+
+            st.subheader("Candidate evidence")
+            packet_evidence = pd.DataFrame(lab_state.get("packet", {}).get("evidence", []))
+            for candidate in lab_state.get("packet", {}).get("candidates", []):
+                symbol = candidate.get("symbol", "")
+                with st.expander(f"{symbol} — score {candidate.get('combined_score', 'n/a')}"):
+                    st.json({key: candidate.get(key) for key in ["name", "seed_memberships", "sector", "technical_score", "fundamental_score", "combined_score", "fundamental_factors"] if key in candidate})
+                    rows = packet_evidence[packet_evidence["symbol"] == symbol] if not packet_evidence.empty and "symbol" in packet_evidence else pd.DataFrame()
+                    if rows.empty:
+                        st.warning("No refreshed company evidence was included; treat this candidate as unresolved.")
+                    else:
+                        st.dataframe(rows[[column for column in ["category", "title", "publisher", "published_at", "status", "source_url"] if column in rows]], width="stretch", hide_index=True)
 
             st.subheader("5. Paper rebalance")
             orders = paper_orders(pd.DataFrame(), decision, lab_config)

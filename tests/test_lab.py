@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 
 from stockpicker.data import load_lab_runs, save_lab_research_details, save_lab_research_snapshot, save_lab_run
-from stockpicker.lab import LabConfig, openai_api_key, optimize_decision, paper_orders, research_packet, validate_decision
+from stockpicker.lab import LabConfig, evidence_health, openai_api_key, optimize_decision, paper_orders, research_packet, validate_decision
 
 
 def _candidates():
@@ -102,3 +102,18 @@ def test_openai_key_reads_macos_keychain_when_environment_is_missing(monkeypatch
     monkeypatch.setattr(lab.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(lab.subprocess, "run", lambda *args, **kwargs: Result())
     assert openai_api_key() == "keychain-key"
+
+
+def test_evidence_health_marks_missing_price_as_critical_and_unrequested_as_unresolved():
+    health = evidence_health({"coverage": {"prices": "unavailable", "fundamentals": "not_requested", "events": "available", "macro": "available", "news": "available"}})
+    levels = {item["source"]: item["severity"] for item in health}
+    assert levels["Price history"] == "critical"
+    assert levels["SEC fundamentals"] == "unresolved"
+
+
+def test_validator_rejects_risk_reference_outside_packet():
+    candidates = _candidates()
+    decision = {"holdings": [{"symbol": "NVDA", "weight": 0.1, "risk_flags": [{"severity": "high", "evidence_refs": ["missing"]}]}], "cash_weight": 0.9, "portfolio_risks": []}
+    result = validate_decision(decision, candidates, LabConfig(), packet={"evidence": []})
+    assert not result.valid
+    assert "outside" in " ".join(result.errors)
