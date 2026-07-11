@@ -1109,7 +1109,6 @@ def main() -> None:
     active_view = st.segmented_control(
         "Dashboard view",
         VIEW_OPTIONS,
-        default=st.session_state["dashboard_view"],
         key="dashboard_view",
         label_visibility="collapsed",
     )
