@@ -22,6 +22,8 @@ Prepare a reviewable packet from a CSV containing at least `symbol` and `score`:
 python -m stockpicker.weekly --candidates data/candidates.csv --refresh-research --output /tmp/chatgptfolio-packet.json
 ```
 
+To freeze the current public S&P 500 constituent master for a research run, use `--sp500-master` instead of `--candidates`.
+
 The command never submits broker orders. Set `CHATGPTFOLIO_USER_AGENT` to a contact-bearing value before using SEC sources at scale.
 
 ## Install

@@ -54,6 +54,7 @@ def research_packet(
     benchmark: str,
     config: LabConfig | None = None,
     refresh_research: bool = False,
+    security_master: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     """Create a bounded, timestamped packet using only recorded source evidence.
 
@@ -114,7 +115,7 @@ def research_packet(
         ],
         "coverage": source_status, "macro": macro, "candidates": enriched,
         "candidate_scores": scores, "evidence": evidence,
-        "security_master": facts[["symbol", "name", "sector", "industry", "eligible"]].to_dict(orient="records"),
+        "security_master": (security_master if security_master is not None else facts)[[column for column in ["symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"] if column in (security_master if security_master is not None else facts)]].to_dict(orient="records"),
         "missing_evidence_policy": "No evidence may be invented. Abstain when the packet cannot support a claim.",
     }
 

@@ -65,6 +65,12 @@ def test_packet_records_explicit_missing_research_without_fetching():
     assert packet["candidates"][0]["combined_score"] == 90.0
 
 
+def test_packet_freezes_supplied_security_master():
+    master = pd.DataFrame([{"symbol": "NVDA", "name": "NVIDIA", "sector": "Information Technology", "industry": "Semiconductors", "eligible": True, "effective_date": "2026-07-01"}])
+    packet = research_packet(_candidates(), date(2026, 7, 1), "SPY", LabConfig(), security_master=master)
+    assert packet["security_master"][0]["sector"] == "Information Technology"
+
+
 def test_research_details_persist_source_level_evidence(tmp_path):
     db_path = tmp_path / "evidence.duckdb"
     packet = {
