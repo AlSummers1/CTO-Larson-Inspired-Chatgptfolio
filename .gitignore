@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 data/market_data.duckdb
 data/market_data.duckdb.wal
+.env
+.env.*

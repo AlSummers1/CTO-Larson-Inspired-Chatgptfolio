@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import date
+import json
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,6 +16,10 @@ from stockpicker.data import (
     load_latest_portfolio_snapshot,
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
+    load_lab_runs,
+    save_lab_paper_orders,
+    save_lab_research_snapshot,
+    save_lab_run,
     save_portfolio_snapshot,
 )
 from stockpicker.portfolio import (
@@ -43,6 +49,17 @@ from stockpicker.signals import (
     weekly_history_with_indicators,
 )
 from stockpicker.universe import UNIVERSE_COLUMNS, load_universe, parse_ticker_text
+from stockpicker.lab import (
+    DEFAULT_MODEL,
+    MODEL_OPTIONS,
+    LabConfig,
+    OpenAIPortfolioModel,
+    config_payload as lab_config_payload,
+    decision_hash,
+    paper_orders,
+    research_packet,
+    validate_decision,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -88,7 +105,7 @@ DEFAULT_RRG_SEED_UNIVERSES = [
     "Cybersecurity Universe",
 ]
 DEFAULT_PORTFOLIO_SEED_UNIVERSES = DEFAULT_RRG_SEED_UNIVERSES
-VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Data Audit"]
+VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Chatgptfolio Lab", "Data Audit"]
 RRG_CONTROL_HELP = {
     "tail_weeks": "How many recent weekly RRG points to draw as each ticker's rotation trail.",
     "ratio_smoothing": "Weeks used to smooth the stock-vs-benchmark relative trend. Higher values make the RS Ratio less jumpy.",
@@ -1541,6 +1558,110 @@ def main() -> None:
                     if column in log.columns:
                         log[column] = log[column] * 100
                 st.dataframe(log, width="stretch", hide_index=True, column_config=portfolio_change_column_config())
+
+    elif active_view == "Chatgptfolio Lab":
+        st.title("Chatgptfolio Lab")
+        st.caption("Auditable OpenAI research and paper trading. This does not place real trades or provide investment advice.")
+        lab_candidates = ranked.head(30).copy()
+        lab_state = st.session_state.get("lab_state", {})
+
+        st.subheader("1. Run setup")
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        selected_model = lc1.selectbox("OpenAI model", MODEL_OPTIONS, index=MODEL_OPTIONS.index(DEFAULT_MODEL), help="Model choice is recorded per run; there is no automatic fallback.")
+        as_of_date = lc2.date_input("As-of date", value=date.today(), max_value=date.today(), help="Current version analyses the locally cached, current-market candidate table. Historical replay is a future extension.")
+        paper_capital = lc3.number_input("Paper capital ($)", min_value=1_000.0, value=100_000.0, step=10_000.0)
+        slippage_bps = lc4.number_input("Slippage (bps)", min_value=0.0, value=5.0, step=1.0)
+        lc5, lc6, lc7 = st.columns(3)
+        lab_max_holdings = lc5.slider("Maximum holdings", 1, 15, 12)
+        lab_max_position = lc6.slider("Maximum position (%)", 1, 25, 12) / 100
+        commission_bps = lc7.number_input("Commission (bps)", min_value=0.0, value=0.0, step=0.5)
+        lab_config = LabConfig(model=selected_model, max_holdings=lab_max_holdings, max_position=lab_max_position, paper_capital=paper_capital, slippage_bps=slippage_bps, commission_bps=commission_bps)
+
+        st.subheader("2. Research packet")
+        packet = research_packet(lab_candidates, as_of_date, benchmark)
+        source_status, coverage_status, candidate_status = st.columns(3)
+        source_status.metric("Price source", "Available")
+        coverage_status.metric("Research completeness", "Prices only")
+        candidate_status.metric("Candidates", len(lab_candidates))
+        st.warning("Fundamental, corporate-event, macro, and news connectors are not configured in this first local build. The model is explicitly told to abstain rather than invent missing evidence.")
+        with st.expander("Inspect immutable research packet"):
+            st.json(packet)
+
+        st.subheader("3. Candidate review")
+        review_columns = [column for column in ["symbol", "name", "theme", "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score", "larsson_regime", "daily_trend", "weekly_trend", "monthly_trend", "data_warnings"] if column in lab_candidates]
+        st.dataframe(lab_candidates[review_columns], width="stretch", hide_index=True)
+
+        if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
+            packet_hash = save_lab_research_snapshot(packet, DEFAULT_DB_PATH)
+            try:
+                decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
+                validation = validate_decision(decision, lab_candidates, lab_config)
+                status = "proposal_ready" if validation.valid else "validation_failed"
+                run_id = save_lab_run({
+                    "as_of_date": as_of_date,
+                    "benchmark": benchmark,
+                    "model": selected_model,
+                    "returned_model": returned_model,
+                    "status": status,
+                    "packet_hash": packet_hash,
+                    "prompt_hash": decision_hash({"packet": packet, "config": lab_config_payload(lab_config)}),
+                    "config_json": json.dumps(lab_config_payload(lab_config)),
+                    "response_json": json.dumps(decision),
+                    "raw_response": raw_response,
+                    "validation_json": json.dumps({"valid": validation.valid, "errors": validation.errors, "warnings": validation.warnings}),
+                }, DEFAULT_DB_PATH)
+                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model}
+                st.rerun()
+            except Exception as exc:
+                run_id = save_lab_run({"as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model, "status": "model_failed", "packet_hash": packet_hash, "config_json": json.dumps(lab_config_payload(lab_config)), "error_message": str(exc)}, DEFAULT_DB_PATH)
+                st.error(f"Analysis was not run (record #{run_id}): {exc}")
+
+        st.subheader("4. ChatGPT proposal")
+        if not lab_state:
+            st.info("No proposal yet. Run the analysis after reviewing the research packet.")
+        else:
+            validation = lab_state["validation"]
+            decision = lab_state["decision"]
+            state1, state2, state3 = st.columns(3)
+            state1.metric("Model", lab_state["model"])
+            state2.metric("Validation", "Ready" if validation.valid else "Failed")
+            state3.metric("Run ID", lab_state["run_id"])
+            if validation.valid:
+                st.success("Proposal passed deterministic limits. Review before approving paper orders.")
+            else:
+                st.error("Proposal is blocked: " + "; ".join(validation.errors))
+            if decision.get("abstain_reason"):
+                st.warning("Model abstained: " + str(decision["abstain_reason"]))
+            st.write(decision.get("portfolio_thesis", ""))
+            proposal = pd.DataFrame(decision.get("holdings", []))
+            if proposal.empty:
+                st.info("No holdings proposed.")
+            else:
+                st.dataframe(proposal, width="stretch", hide_index=True)
+
+            st.subheader("5. Paper rebalance")
+            orders = paper_orders(pd.DataFrame(), decision, lab_config)
+            if orders.empty:
+                st.info("No paper orders proposed.")
+            else:
+                orders_display = orders.copy()
+                for column in ["previous_weight", "target_weight"]:
+                    orders_display[column] = orders_display[column] * 100
+                st.dataframe(orders_display, width="stretch", hide_index=True)
+                if validation.valid and st.button("Approve and save paper orders"):
+                    save_lab_paper_orders(int(lab_state["run_id"]), orders, DEFAULT_DB_PATH)
+                    st.success("Paper orders saved. No broker was contacted.")
+
+            with st.expander("Decision audit"):
+                st.json(decision)
+
+        st.subheader("6. Audit & performance")
+        runs = load_lab_runs(DEFAULT_DB_PATH)
+        if runs.empty:
+            st.info("No prior lab runs saved.")
+        else:
+            st.dataframe(runs, width="stretch", hide_index=True)
+            st.caption("NAV/replay reporting is not enabled until point-in-time fundamental, event, and news data sources are connected.")
 
     elif active_view == "Data Audit":
         st.subheader("Fetch Log")

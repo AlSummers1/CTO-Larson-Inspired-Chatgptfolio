@@ -4,6 +4,15 @@ This is a local Streamlit dashboard for ranking technology, AI, semiconductor, c
 
 It is informational only. It does not place trades, does not connect to a broker, and does not require or store API keys. The first version uses `yfinance` as its only market data source.
 
+## Chatgptfolio Lab
+
+The `Chatgptfolio Lab` dashboard view adds an auditable paper-trading workflow using OpenAI Responses API models. It is an experimental research tool, not investment advice and it never contacts a broker.
+
+- Default decision model: `gpt-5.5`; selectable alternatives: `gpt-5.4`, `gpt-5.4-mini`.
+- Set `OPENAI_API_KEY` in your environment before running a model analysis. The application never writes API keys to DuckDB, logs, snapshots, or source control.
+- Research packets, model configuration, raw structured responses, validation results, and paper orders are persisted locally for audit.
+- The initial packet uses the dashboard's locally cached prices and technical signals. It deliberately labels fundamentals, corporate events, macro data, and news as unavailable; the model is instructed to abstain rather than fabricate missing evidence.
+
 ## Install
 
 ```bash

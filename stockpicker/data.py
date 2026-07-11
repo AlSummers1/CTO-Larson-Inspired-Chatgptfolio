@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import hashlib
 from pathlib import Path
 from typing import Iterable
 
@@ -149,6 +150,10 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
             conn.execute(f"ALTER TABLE portfolio_holdings ADD COLUMN IF NOT EXISTS {column} VARCHAR")
         for column in ["drawdown_52w", "extension_sma50d"]:
             conn.execute(f"ALTER TABLE portfolio_holdings ADD COLUMN IF NOT EXISTS {column} DOUBLE")
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS lab_run_id_seq START 1")
+        conn.execute("CREATE TABLE IF NOT EXISTS lab_research_snapshots (snapshot_hash VARCHAR PRIMARY KEY, as_of_date DATE, created_at TIMESTAMP, packet_json VARCHAR)")
+        conn.execute("CREATE TABLE IF NOT EXISTS lab_runs (run_id INTEGER DEFAULT nextval('lab_run_id_seq'), created_at TIMESTAMP, as_of_date DATE, benchmark VARCHAR, model VARCHAR, returned_model VARCHAR, status VARCHAR, packet_hash VARCHAR, prompt_hash VARCHAR, config_json VARCHAR, response_json VARCHAR, raw_response VARCHAR, validation_json VARCHAR, error_message VARCHAR)")
+        conn.execute("CREATE TABLE IF NOT EXISTS lab_paper_orders (run_id INTEGER, symbol VARCHAR, action VARCHAR, previous_weight DOUBLE, target_weight DOUBLE, notional DOUBLE, estimated_cost DOUBLE, status VARCHAR)")
 
 
 def _normalize_symbols(symbols: Iterable[str]) -> list[str]:
@@ -382,6 +387,51 @@ def latest_cache_timestamp(db_path: Path = DEFAULT_DB_PATH) -> str:
         return "Never"
     fetched_at = pd.to_datetime(log["fetched_at"]).max()
     return fetched_at.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def save_lab_research_snapshot(packet: dict[str, object], db_path: Path = DEFAULT_DB_PATH) -> str:
+    """Persist an immutable, point-in-time research packet and return its hash."""
+    init_database(db_path)
+    payload = json.dumps(packet, sort_keys=True, default=str, separators=(",", ":"))
+    packet_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    with _connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO lab_research_snapshots VALUES (?, ?, ?, ?)",
+            [packet_hash, packet.get("as_of_date"), datetime.now(timezone.utc).replace(tzinfo=None), payload],
+        )
+    return packet_hash
+
+
+def save_lab_run(record: dict[str, object], db_path: Path = DEFAULT_DB_PATH) -> int:
+    """Store an LLM decision without storing credentials."""
+    init_database(db_path)
+    fields = ["created_at", "as_of_date", "benchmark", "model", "returned_model", "status", "packet_hash", "prompt_hash", "config_json", "response_json", "raw_response", "validation_json", "error_message"]
+    values = [record.get(field) for field in fields]
+    values[0] = values[0] or datetime.now(timezone.utc).replace(tzinfo=None)
+    with _connect(db_path) as conn:
+        return int(conn.execute(
+            "INSERT INTO lab_runs (" + ", ".join(fields) + ") VALUES (" + ", ".join(["?"] * len(fields)) + ") RETURNING run_id",
+            values,
+        ).fetchone()[0])
+
+
+def save_lab_paper_orders(run_id: int, orders: pd.DataFrame, db_path: Path = DEFAULT_DB_PATH) -> None:
+    if orders.empty:
+        return
+    init_database(db_path)
+    columns = ["run_id", "symbol", "action", "previous_weight", "target_weight", "notional", "estimated_cost", "status"]
+    prepared = orders.copy()
+    prepared["run_id"] = run_id
+    with _connect(db_path) as conn:
+        conn.register("_lab_orders", prepared[columns])
+        conn.execute("INSERT INTO lab_paper_orders SELECT * FROM _lab_orders")
+        conn.unregister("_lab_orders")
+
+
+def load_lab_runs(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute("SELECT run_id, created_at, as_of_date, benchmark, model, returned_model, status, packet_hash, error_message FROM lab_runs ORDER BY run_id DESC").fetchdf()
 
 
 def save_portfolio_snapshot(
