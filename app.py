@@ -19,6 +19,7 @@ from stockpicker.data import (
     load_lab_runs,
     save_lab_paper_orders,
     save_lab_research_snapshot,
+    save_lab_research_details,
     save_lab_run,
     save_portfolio_snapshot,
 )
@@ -57,6 +58,7 @@ from stockpicker.lab import (
     config_payload as lab_config_payload,
     decision_hash,
     paper_orders,
+    optimize_decision,
     research_packet,
     validate_decision,
 )
@@ -1575,15 +1577,18 @@ def main() -> None:
         lab_max_holdings = lc5.slider("Maximum holdings", 1, 15, 12)
         lab_max_position = lc6.slider("Maximum position (%)", 1, 25, 12) / 100
         commission_bps = lc7.number_input("Commission (bps)", min_value=0.0, value=0.0, step=0.5)
-        lab_config = LabConfig(model=selected_model, max_holdings=lab_max_holdings, max_position=lab_max_position, paper_capital=paper_capital, slippage_bps=slippage_bps, commission_bps=commission_bps)
+        lc8, lc9 = st.columns(2)
+        lab_max_sector = lc8.slider("Maximum sector exposure (%)", 10, 80, 40, step=5) / 100
+        refresh_research = lc9.checkbox("Refresh public research evidence", value=True, help="Fetches bounded SEC, FRED, and curated-news evidence only when an analysis is run.")
+        lab_config = LabConfig(model=selected_model, max_holdings=lab_max_holdings, max_position=lab_max_position, max_sector_exposure=lab_max_sector, paper_capital=paper_capital, slippage_bps=slippage_bps, commission_bps=commission_bps)
 
         st.subheader("2. Research packet")
-        packet = research_packet(lab_candidates, as_of_date, benchmark)
+        packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False)
         source_status, coverage_status, candidate_status = st.columns(3)
         source_status.metric("Price source", "Available")
-        coverage_status.metric("Research completeness", "Prices only")
+        coverage_status.metric("Research completeness", "Ready to refresh" if refresh_research else "Cached prices only")
         candidate_status.metric("Candidates", len(lab_candidates))
-        st.warning("Fundamental, corporate-event, macro, and news connectors are not configured in this first local build. The model is explicitly told to abstain rather than invent missing evidence.")
+        st.caption("Weekly research uses timestamped SEC/EDGAR, FRED, and curated-news evidence when refreshed. Missing sources remain visible and are never filled by model inference.")
         with st.expander("Inspect immutable research packet"):
             st.json(packet)
 
@@ -1592,9 +1597,12 @@ def main() -> None:
         st.dataframe(lab_candidates[review_columns], width="stretch", hide_index=True)
 
         if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
+            packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research)
             packet_hash = save_lab_research_snapshot(packet, DEFAULT_DB_PATH)
+            save_lab_research_details(packet_hash, packet, DEFAULT_DB_PATH)
             try:
-                decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
+                model_decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
+                decision = optimize_decision(model_decision, lab_candidates, lab_config)
                 validation = validate_decision(decision, lab_candidates, lab_config)
                 status = "proposal_ready" if validation.valid else "validation_failed"
                 run_id = save_lab_run({
@@ -1606,11 +1614,11 @@ def main() -> None:
                     "packet_hash": packet_hash,
                     "prompt_hash": decision_hash({"packet": packet, "config": lab_config_payload(lab_config)}),
                     "config_json": json.dumps(lab_config_payload(lab_config)),
-                    "response_json": json.dumps(decision),
+                    "response_json": json.dumps({"model_decision": model_decision, "optimized_decision": decision}),
                     "raw_response": raw_response,
                     "validation_json": json.dumps({"valid": validation.valid, "errors": validation.errors, "warnings": validation.warnings}),
                 }, DEFAULT_DB_PATH)
-                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model}
+                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model, "packet": packet}
                 st.rerun()
             except Exception as exc:
                 run_id = save_lab_run({"as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model, "status": "model_failed", "packet_hash": packet_hash, "config_json": json.dumps(lab_config_payload(lab_config)), "error_message": str(exc)}, DEFAULT_DB_PATH)
@@ -1633,6 +1641,9 @@ def main() -> None:
             if decision.get("abstain_reason"):
                 st.warning("Model abstained: " + str(decision["abstain_reason"]))
             st.write(decision.get("portfolio_thesis", ""))
+            optimization = decision.get("optimization", {})
+            if optimization:
+                st.caption(f"Deterministic allocator: {optimization.get('allocated_equity', 0):.1%} equity / {decision.get('cash_weight', 0):.1%} cash. Binding constraints: {', '.join(optimization.get('binding_constraints', [])) or 'none'}.")
             proposal = pd.DataFrame(decision.get("holdings", []))
             if proposal.empty:
                 st.info("No holdings proposed.")
@@ -1655,13 +1666,20 @@ def main() -> None:
             with st.expander("Decision audit"):
                 st.json(decision)
 
+            with st.expander("Research evidence used"):
+                evidence = pd.DataFrame(lab_state.get("packet", {}).get("evidence", []))
+                if evidence.empty:
+                    st.info("No refreshed external evidence was included in this run.")
+                else:
+                    st.dataframe(evidence[[column for column in ["symbol", "category", "title", "publisher", "published_at", "status", "source_url"] if column in evidence]], width="stretch", hide_index=True)
+
         st.subheader("6. Audit & performance")
         runs = load_lab_runs(DEFAULT_DB_PATH)
         if runs.empty:
             st.info("No prior lab runs saved.")
         else:
             st.dataframe(runs, width="stretch", hide_index=True)
-            st.caption("NAV/replay reporting is not enabled until point-in-time fundamental, event, and news data sources are connected.")
+            st.caption("Runs preserve an immutable packet and source timestamps. Historical replay must reject evidence published or fetched after its as-of date.")
 
     elif active_view == "Data Audit":
         st.subheader("Fetch Log")

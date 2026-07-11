@@ -154,6 +154,31 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS lab_research_snapshots (snapshot_hash VARCHAR PRIMARY KEY, as_of_date DATE, created_at TIMESTAMP, packet_json VARCHAR)")
         conn.execute("CREATE TABLE IF NOT EXISTS lab_runs (run_id INTEGER DEFAULT nextval('lab_run_id_seq'), created_at TIMESTAMP, as_of_date DATE, benchmark VARCHAR, model VARCHAR, returned_model VARCHAR, status VARCHAR, packet_hash VARCHAR, prompt_hash VARCHAR, config_json VARCHAR, response_json VARCHAR, raw_response VARCHAR, validation_json VARCHAR, error_message VARCHAR)")
         conn.execute("CREATE TABLE IF NOT EXISTS lab_paper_orders (run_id INTEGER, symbol VARCHAR, action VARCHAR, previous_weight DOUBLE, target_weight DOUBLE, notional DOUBLE, estimated_cost DOUBLE, status VARCHAR)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_security_master (
+                snapshot_hash VARCHAR, symbol VARCHAR, name VARCHAR, sector VARCHAR, industry VARCHAR,
+                eligible BOOLEAN, effective_date DATE, source_url VARCHAR, fetched_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_evidence (
+                evidence_id VARCHAR PRIMARY KEY, snapshot_hash VARCHAR, symbol VARCHAR, category VARCHAR,
+                title VARCHAR, summary VARCHAR, source_url VARCHAR, publisher VARCHAR, published_at TIMESTAMP,
+                fetched_at TIMESTAMP, content_hash VARCHAR, status VARCHAR
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_factor_scores (
+                snapshot_hash VARCHAR, symbol VARCHAR, technical_score DOUBLE, fundamental_score DOUBLE,
+                combined_score DOUBLE, liquidity_score DOUBLE, sector VARCHAR, score_json VARCHAR
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_nav (
+                run_id INTEGER, date DATE, nav DOUBLE, benchmark_nav DOUBLE, technical_nav DOUBLE,
+                drawdown DOUBLE, turnover DOUBLE
+            )
+        """)
 
 
 def _normalize_symbols(symbols: Iterable[str]) -> list[str]:
@@ -400,6 +425,45 @@ def save_lab_research_snapshot(packet: dict[str, object], db_path: Path = DEFAUL
             [packet_hash, packet.get("as_of_date"), datetime.now(timezone.utc).replace(tzinfo=None), payload],
         )
     return packet_hash
+
+
+def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_path: Path = DEFAULT_DB_PATH) -> None:
+    """Persist source-level evidence and factor scores without ever storing credentials."""
+    init_database(db_path)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    evidence = packet.get("evidence", [])
+    scores = packet.get("candidate_scores", [])
+    master = packet.get("security_master", [])
+    with _connect(db_path) as conn:
+        if isinstance(evidence, list) and evidence:
+            frame = pd.DataFrame(evidence)
+            required = ["evidence_id", "symbol", "category", "title", "summary", "source_url", "publisher", "published_at", "fetched_at", "content_hash", "status"]
+            for column in required:
+                if column not in frame:
+                    frame[column] = None
+            frame["snapshot_hash"] = packet_hash
+            conn.register("_lab_evidence", frame[["evidence_id", "snapshot_hash", *required[1:]]])
+            conn.execute("INSERT OR IGNORE INTO lab_evidence SELECT * FROM _lab_evidence")
+            conn.unregister("_lab_evidence")
+        if isinstance(scores, list) and scores:
+            frame = pd.DataFrame(scores)
+            for column in ["symbol", "technical_score", "fundamental_score", "combined_score", "liquidity_score", "sector", "score_json"]:
+                if column not in frame:
+                    frame[column] = None
+            frame["snapshot_hash"] = packet_hash
+            conn.register("_lab_scores", frame[["snapshot_hash", "symbol", "technical_score", "fundamental_score", "combined_score", "liquidity_score", "sector", "score_json"]])
+            conn.execute("INSERT INTO lab_factor_scores SELECT * FROM _lab_scores")
+            conn.unregister("_lab_scores")
+        if isinstance(master, list) and master:
+            frame = pd.DataFrame(master)
+            for column in ["symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"]:
+                if column not in frame:
+                    frame[column] = None
+            frame["snapshot_hash"] = packet_hash
+            frame["fetched_at"] = frame["fetched_at"].fillna(now)
+            conn.register("_lab_master", frame[["snapshot_hash", "symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"]])
+            conn.execute("INSERT INTO lab_security_master SELECT * FROM _lab_master")
+            conn.unregister("_lab_master")
 
 
 def save_lab_run(record: dict[str, object], db_path: Path = DEFAULT_DB_PATH) -> int:
