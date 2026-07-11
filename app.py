@@ -1123,9 +1123,9 @@ def main() -> None:
             daily_history = price_history_with_indicators(prices, selected, config)
             weekly_history = weekly_history_with_indicators(prices, selected, config)
             dd_history = drawdown_history(prices, selected)
-            st.plotly_chart(price_chart(daily_history, selected), width="stretch")
-            st.plotly_chart(weekly_chart(weekly_history, selected), width="stretch")
-            st.plotly_chart(drawdown_chart(dd_history, selected), width="stretch")
+            st.plotly_chart(price_chart(daily_history, selected), use_container_width=True)
+            st.plotly_chart(weekly_chart(weekly_history, selected), use_container_width=True)
+            st.plotly_chart(drawdown_chart(dd_history, selected), use_container_width=True)
 
             raw_columns = [
                 "symbol",
@@ -1181,7 +1181,7 @@ def main() -> None:
                         "larsson_regime_history_labels": [", ".join(benchmark_history["larsson_regime"].tolist())],
                     }
                 ),
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
                 column_config={
                     "larsson_regime_history": st.column_config.BarChartColumn(
@@ -1213,7 +1213,7 @@ def main() -> None:
                     benchmark,
                     scaled_basket_overlay(benchmark_daily, basket_history, "close"),
                 ),
-                width="stretch",
+                use_container_width=True,
             )
             st.plotly_chart(
                 weekly_chart(
@@ -1221,7 +1221,7 @@ def main() -> None:
                     benchmark,
                     scaled_basket_overlay(benchmark_weekly, basket_weekly, "weekly_close"),
                 ),
-                width="stretch",
+                use_container_width=True,
             )
             st.plotly_chart(
                 drawdown_chart(
@@ -1229,7 +1229,7 @@ def main() -> None:
                     benchmark,
                     basket_drawdown_overlay(basket_history),
                 ),
-                width="stretch",
+                use_container_width=True,
             )
 
     elif active_view == "RRG":
@@ -1299,7 +1299,7 @@ def main() -> None:
                     rrg_fig = rrg_chart(rrg_history, latest_rrg, benchmark, selected_symbol=selected_symbol)
                     rrg_event = st.plotly_chart(
                         rrg_fig,
-                        width="stretch",
+                        use_container_width=True,
                         key="rrg_stock_chart",
                         on_select="rerun",
                         selection_mode="points",
@@ -1357,7 +1357,7 @@ def main() -> None:
                     st.info("No seed RRG rows available. Try a longer price history or fewer smoothing weeks.")
                 else:
                     latest_seed_history = latest_seed_rrg(seed_history)
-                    st.plotly_chart(rrg_seed_chart(seed_history, latest_seed_history, benchmark), width="stretch")
+                    st.plotly_chart(rrg_seed_chart(seed_history, latest_seed_history, benchmark), use_container_width=True)
                     st.dataframe(
                         latest_seed_history[
                             [
@@ -1501,8 +1501,8 @@ def main() -> None:
             )
 
             cc1, cc2 = st.columns(2)
-            cc1.plotly_chart(allocation_pie_chart(applied_target, "symbol", "Allocation by Holding"), width="stretch")
-            cc2.plotly_chart(allocation_pie_chart(applied_target, "seed_universe", "Allocation by Seed Universe"), width="stretch")
+            cc1.plotly_chart(allocation_pie_chart(applied_target, "symbol", "Allocation by Holding"), use_container_width=True)
+            cc2.plotly_chart(allocation_pie_chart(applied_target, "seed_universe", "Allocation by Seed Universe"), use_container_width=True)
 
             st.subheader("Changes Since Matching Baseline")
             change_display = changes.copy()
