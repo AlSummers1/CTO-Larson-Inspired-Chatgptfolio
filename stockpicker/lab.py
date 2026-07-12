@@ -17,7 +17,7 @@ from typing import Any
 
 import pandas as pd
 
-from .research import fetch_macro_snapshot, fetch_news, fetch_sec_company_research, fundamental_score
+from .research import fetch_macro_snapshot, fetch_gdelt_news, fetch_sec_company_research, fundamental_score
 
 MODEL_OPTIONS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 DEFAULT_MODEL = "gpt-5.5"
@@ -45,6 +45,76 @@ class ValidationResult:
     valid: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def _price_series(prices: pd.DataFrame, symbol: str) -> pd.Series:
+    if prices.empty or "symbol" not in prices:
+        return pd.Series(dtype=float)
+    rows = prices[prices["symbol"].astype(str).str.upper() == symbol.upper()][["date", "close"]].copy()
+    if rows.empty:
+        return pd.Series(dtype=float)
+    rows["date"] = pd.to_datetime(rows["date"], errors="coerce")
+    rows["close"] = pd.to_numeric(rows["close"], errors="coerce")
+    return rows.dropna().drop_duplicates("date", keep="last").sort_values("date").set_index("date")["close"]
+
+
+def entry_signal(prices: pd.DataFrame, symbol: str, regime: str = "", daily_trend: str = "", weekly_trend: str = "", monthly_trend: str = "") -> dict[str, object]:
+    """Return reproducible, non-predictive entry guidance from local adjusted prices."""
+    close = _price_series(prices, symbol)
+    unresolved = {"entry_label": "Unresolved", "entry_score": None, "preferred_entry_low": None, "preferred_entry_high": None, "trend_invalidation": None, "latest_price": None, "extension_50d": None, "atr_14d": None, "reason": "insufficient price history"}
+    if len(close) < 50:
+        return unresolved
+    latest = float(close.iloc[-1])
+    sma20, sma50 = float(close.tail(20).mean()), float(close.tail(50).mean())
+    sma200 = float(close.tail(200).mean()) if len(close) >= 200 else None
+    high20 = float(close.tail(20).max())
+    atr_proxy = float(close.pct_change().abs().tail(14).mean() * latest)
+    extension = latest / sma50 - 1.0 if sma50 else None
+    constructive = regime == "Bull" and daily_trend == weekly_trend == monthly_trend == "Up" and (sma200 is None or latest > sma200)
+    low, high = min(sma20, sma50) * 0.98, max(sma20, sma50) * 1.02
+    invalidation = sma50 - 1.5 * atr_proxy
+    if not constructive:
+        label, score, reason = "Avoid", 15, "trend/regime is not fully constructive"
+    elif extension is not None and extension > 0.08:
+        label, score, reason = "Wait — don't chase", 35, "price is more than 8% above its 50-day average"
+    elif low <= latest <= high:
+        label, score, reason = "Add", 85, "price is in the calculated moving-average entry zone"
+    elif latest >= high20 * 0.98:
+        label, score, reason = "Wait — confirm", 65, "near a 20-day high; await a confirmed breakout or pullback"
+    else:
+        label, score, reason = "Wait — confirm", 55, "constructive trend, but price is outside the preferred entry zone"
+    return {"entry_label": label, "entry_score": score, "preferred_entry_low": round(low, 2), "preferred_entry_high": round(high, 2), "trend_invalidation": round(invalidation, 2), "latest_price": round(latest, 2), "extension_50d": round(extension or 0.0, 4), "atr_14d": round(atr_proxy, 2), "reason": reason}
+
+
+def correlation_summary(prices: pd.DataFrame, symbols: list[str], held_symbols: list[str] | None = None) -> dict[str, object]:
+    """Compute bounded daily/weekly return correlations for an immutable packet."""
+    symbols = list(dict.fromkeys(str(symbol).upper() for symbol in symbols if symbol))
+    held = {str(symbol).upper() for symbol in (held_symbols or [])}
+    matrix_symbols = list(dict.fromkeys(symbols + sorted(held)))
+    closes = pd.DataFrame({symbol: _price_series(prices, symbol) for symbol in matrix_symbols}).sort_index()
+    daily = closes.pct_change().tail(50)
+    weekly = closes.resample("W-FRI").last().pct_change().tail(26) if not closes.empty else pd.DataFrame()
+    daily_corr = daily.corr(min_periods=40)
+    weekly_corr = weekly.corr(min_periods=20)
+    pairs: list[dict[str, object]] = []
+    clusters: dict[str, set[str]] = {symbol: {symbol} for symbol in matrix_symbols}
+    for index, left in enumerate(symbols):
+        for right in symbols[index + 1:]:
+            value = daily_corr.loc[left, right] if left in daily_corr.index and right in daily_corr.columns else float("nan")
+            weekly_value = weekly_corr.loc[left, right] if left in weekly_corr.index and right in weekly_corr.columns else float("nan")
+            if pd.notna(value) and float(value) >= 0.80:
+                pairs.append({"left": left, "right": right, "daily_correlation": round(float(value), 3), "weekly_correlation": None if pd.isna(weekly_value) else round(float(weekly_value), 3), "severity": "high"})
+                merged = clusters[left] | clusters[right]
+                for member in merged:
+                    clusters[member] = merged
+    candidates = []
+    for symbol in symbols:
+        others = [other for other in symbols if other != symbol]
+        values = daily_corr.loc[symbol, others].dropna() if symbol in daily_corr.index and others else pd.Series(dtype=float)
+        to_held = daily_corr.loc[symbol, [other for other in held if other != symbol and other in daily_corr.columns]].dropna() if symbol in daily_corr.index and held else pd.Series(dtype=float)
+        candidates.append({"symbol": symbol, "daily_observations": int(daily[symbol].dropna().shape[0]) if symbol in daily else 0, "weekly_observations": int(weekly[symbol].dropna().shape[0]) if symbol in weekly else 0, "average_daily_correlation": None if values.empty else round(float(values.mean()), 3), "max_daily_correlation": None if values.empty else round(float(values.max()), 3), "average_correlation_to_held": None if to_held.empty else round(float(to_held.mean()), 3), "cluster": " · ".join(sorted(clusters[symbol])) if len(clusters[symbol]) > 1 else "independent", "status": "available" if len(values) else "unresolved"})
+    matrix = daily_corr.round(3).where(pd.notna(daily_corr), None).to_dict() if not daily_corr.empty else {}
+    return {"daily_window": 50, "daily_min_observations": 40, "weekly_window": 26, "weekly_min_observations": 20, "candidate_summary": candidates, "high_correlation_pairs": pairs, "daily_matrix": matrix, "status": "available" if not daily_corr.empty else "unresolved"}
 
 
 def credential_status(last_error: str | None = None) -> str:
@@ -95,6 +165,8 @@ def research_packet(
     config: LabConfig | None = None,
     refresh_research: bool = False,
     security_master: pd.DataFrame | None = None,
+    prices: pd.DataFrame | None = None,
+    held_symbols: list[str] | None = None,
 ) -> dict[str, object]:
     """Create a bounded, timestamped packet using only recorded source evidence.
 
@@ -127,7 +199,8 @@ def research_packet(
         connector_timings["fundamentals"] = round((perf_counter() - started_at) * 1000, 1)
         connector_timings["events"] = connector_timings["fundamentals"]
         started_at = perf_counter()
-        news_evidence = fetch_news(symbols, config.research_limit)
+        names = {str(row.get("symbol", "")).upper(): str(row.get("name", row.get("symbol", ""))) for _, row in facts.iterrows()}
+        news_evidence = fetch_gdelt_news(symbols, names, config.research_limit)
         connector_timings["news"] = round((perf_counter() - started_at) * 1000, 1)
         evidence = macro_evidence + sec_evidence + news_evidence
         source_status.update({
@@ -156,9 +229,18 @@ def research_packet(
         item["fundamental_score"] = fund_score
         item["combined_score"] = combined
         item["fundamental_factors"] = factors
+        item["entry"] = entry_signal(
+            prices if prices is not None else pd.DataFrame(), symbol,
+            str(item.get("larsson_regime", "")), str(item.get("daily_trend", "")),
+            str(item.get("weekly_trend", "")), str(item.get("monthly_trend", "")),
+        )
         enriched.append(item)
         scores.append({"symbol": symbol, "technical_score": technical, "fundamental_score": fund_score, "combined_score": combined, "liquidity_score": item["liquidity_score"], "sector": item.get("sector", "Unclassified"), "score_json": json.dumps(factors, default=str)})
     enriched.sort(key=lambda item: float(item.get("combined_score", 0)), reverse=True)
+    correlations = correlation_summary(prices if prices is not None else pd.DataFrame(), symbols, held_symbols)
+    correlation_lookup = {str(item["symbol"]): item for item in correlations["candidate_summary"]}
+    for item in enriched:
+        item["correlation"] = correlation_lookup.get(str(item.get("symbol", "")), {"status": "unresolved"})
     for column in facts.select_dtypes(include=["datetime", "datetimetz"]).columns:
         facts[column] = facts[column].astype(str)
     quality = {}
@@ -177,7 +259,7 @@ def research_packet(
         ],
         "coverage": source_status, "source_quality": quality, "connector_timings_ms": connector_timings,
         "source_diagnostics": source_diagnostics, "macro": macro, "candidates": enriched,
-        "candidate_scores": scores, "evidence": evidence,
+        "candidate_scores": scores, "evidence": evidence, "correlations": correlations,
         "security_master": (security_master if security_master is not None else facts)[[column for column in ["symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"] if column in (security_master if security_master is not None else facts)]].to_dict(orient="records"),
         "missing_evidence_policy": "No evidence may be invented. Abstain when the packet cannot support a claim.",
     }
@@ -186,7 +268,7 @@ def research_packet(
 def prompt_for_packet(packet: dict[str, object], config: LabConfig) -> str:
     return f"""You are Chatgptfolio's research underwriter. Use ONLY the timestamped research packet below. Do not invent news, fundamentals, prices, citations, targets, or events. This is paper-trading research, not investment advice. Prefer abstaining when evidence is insufficient.
 
-Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Explain downside triggers and bull/base/bear valuation scenarios. Classify every investment risk as critical, high, medium, low, or unresolved and cite packet evidence for it. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
+Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Treat the packet's correlation data as a diversification preference: avoid redundant high-correlation combinations when conviction is comparable. Explain downside triggers and bull/base/bear valuation scenarios. Classify every investment risk as critical, high, medium, low, or unresolved and cite packet evidence for it. Do NOT return entry prices, targets, stops, or valuation levels: the UI attaches deterministic price guidance from the packet. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
 
 Return JSON matching the requested schema.
 
@@ -209,7 +291,7 @@ DECISION_SCHEMA: dict[str, Any] = {
 def evidence_health(packet: dict[str, object]) -> list[dict[str, str]]:
     """Classify evidence completeness deterministically for the UI and audit trail."""
     coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
-    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "Curated news"}
+    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "GDELT news discovery"}
     output = []
     for key, label in labels.items():
         status = str(coverage.get(key, "unresolved"))
@@ -348,6 +430,7 @@ def optimize_decision(
 
 def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, config: LabConfig, previous: pd.DataFrame | None = None, packet: dict[str, object] | None = None) -> ValidationResult:
     errors: list[str] = []
+    warnings: list[str] = []
     holdings = decision.get("holdings", [])
     if not isinstance(holdings, list):
         return ValidationResult(False, ["holdings must be an array"])
@@ -393,7 +476,17 @@ def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, con
             refs = {str(ref) for ref in flag.get("evidence_refs", [])}
             if refs and not refs.issubset(evidence_ids):
                 errors.append("risk flag references evidence outside the research packet")
-    return ValidationResult(not errors, errors)
+        selected = set(symbols)
+        correlation = packet.get("correlations", {}) if isinstance(packet, dict) else {}
+        for pair in correlation.get("high_correlation_pairs", []) if isinstance(correlation, dict) else []:
+            if isinstance(pair, dict) and {str(pair.get("left", "")), str(pair.get("right", ""))}.issubset(selected):
+                warnings.append(f"high daily correlation: {pair.get('left')} / {pair.get('right')} ({float(pair.get('daily_correlation', 0)):.2f})")
+        summary = {str(item.get("symbol")): item for item in correlation.get("candidate_summary", []) if isinstance(item, dict)} if isinstance(correlation, dict) else {}
+        for symbol in selected:
+            value = summary.get(symbol, {}).get("average_correlation_to_held")
+            if isinstance(value, (int, float)) and value > 0.70:
+                warnings.append(f"{symbol} has high average correlation to current holdings ({value:.2f})")
+    return ValidationResult(not errors, errors, warnings)
 
 
 def paper_orders(previous: pd.DataFrame, decision: dict[str, object], config: LabConfig) -> pd.DataFrame:

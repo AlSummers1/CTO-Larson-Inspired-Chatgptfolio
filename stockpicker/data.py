@@ -166,9 +166,11 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
             CREATE TABLE IF NOT EXISTS lab_evidence (
                 evidence_id VARCHAR PRIMARY KEY, snapshot_hash VARCHAR, symbol VARCHAR, category VARCHAR,
                 title VARCHAR, summary VARCHAR, source_url VARCHAR, publisher VARCHAR, published_at TIMESTAMP,
-                fetched_at TIMESTAMP, content_hash VARCHAR, status VARCHAR
+                fetched_at TIMESTAMP, content_hash VARCHAR, status VARCHAR, source_tier VARCHAR, source_domain VARCHAR
             )
         """)
+        conn.execute("ALTER TABLE lab_evidence ADD COLUMN IF NOT EXISTS source_tier VARCHAR")
+        conn.execute("ALTER TABLE lab_evidence ADD COLUMN IF NOT EXISTS source_domain VARCHAR")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lab_factor_scores (
                 snapshot_hash VARCHAR, symbol VARCHAR, technical_score DOUBLE, fundamental_score DOUBLE,
@@ -510,7 +512,7 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
     with _connect(db_path) as conn:
         if isinstance(evidence, list) and evidence:
             frame = pd.DataFrame(evidence)
-            required = ["evidence_id", "symbol", "category", "title", "summary", "source_url", "publisher", "published_at", "fetched_at", "content_hash", "status"]
+            required = ["evidence_id", "symbol", "category", "title", "summary", "source_url", "publisher", "published_at", "fetched_at", "content_hash", "status", "source_tier", "source_domain"]
             for column in required:
                 if column not in frame:
                     frame[column] = None
@@ -521,7 +523,7 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
                 frame[column] = pd.to_datetime(frame[column], errors="coerce", utc=True).dt.tz_convert(None)
             frame["snapshot_hash"] = packet_hash
             conn.register("_lab_evidence", frame[["evidence_id", "snapshot_hash", *required[1:]]])
-            conn.execute("INSERT OR IGNORE INTO lab_evidence SELECT * FROM _lab_evidence")
+            conn.execute("INSERT OR IGNORE INTO lab_evidence (evidence_id, snapshot_hash, symbol, category, title, summary, source_url, publisher, published_at, fetched_at, content_hash, status, source_tier, source_domain) SELECT * FROM _lab_evidence")
             conn.unregister("_lab_evidence")
         if isinstance(scores, list) and scores:
             frame = pd.DataFrame(scores)
@@ -550,7 +552,7 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
             "fundamentals": "SEC EDGAR fundamentals",
             "events": "SEC EDGAR filings",
             "macro": "FRED macro",
-            "news": "Curated news RSS",
+            "news": "GDELT news discovery",
         }
         for key, label in source_labels.items():
             status = str(coverage.get(key, "unresolved"))

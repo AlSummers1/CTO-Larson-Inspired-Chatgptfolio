@@ -13,9 +13,8 @@ import json
 import os
 from time import monotonic
 from typing import Any, Protocol
-from urllib.parse import quote_plus
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
 
 import pandas as pd
 
@@ -28,6 +27,8 @@ CONNECTOR_TIMEOUT_SECONDS = 10
 MACRO_BUDGET_SECONDS = 30
 COMPANY_RESEARCH_BUDGET_SECONDS = 45
 NEWS_BUDGET_SECONDS = 30
+GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+GDELT_DENYLIST = {"prnewswire.com", "businesswire.com", "globenewswire.com", "accesswire.com", "news.google.com", "finance.yahoo.com", "reddit.com", "x.com", "twitter.com"}
 
 
 class EnrichmentProvider(Protocol):
@@ -79,6 +80,8 @@ def evidence_record(
     publisher: str,
     published_at: str | None = None,
     status: str = "available",
+    source_tier: str = "primary",
+    source_domain: str | None = None,
 ) -> dict[str, str | None]:
     fetched_at = _now()
     digest = hashlib.sha256(f"{symbol}|{category}|{title}|{source_url}|{published_at}".encode()).hexdigest()
@@ -87,6 +90,7 @@ def evidence_record(
         "title": title[:500], "summary": summary[:2_000], "source_url": source_url,
         "publisher": publisher, "published_at": published_at, "fetched_at": fetched_at,
         "content_hash": digest, "status": status,
+        "source_tier": source_tier, "source_domain": source_domain or urlparse(source_url).netloc.lower(),
     }
 
 
@@ -200,20 +204,53 @@ def fetch_sec_company_research(symbols: list[str], limit: int = 30) -> tuple[dic
     return output, evidence
 
 
-def fetch_news(symbols: list[str], limit: int = 20, items_per_symbol: int = 3) -> list[dict[str, Any]]:
+def fetch_gdelt_news(symbols: list[str], company_names: dict[str, str] | None = None, limit: int = 30, items_per_symbol: int = 5) -> list[dict[str, Any]]:
+    """Fetch bounded secondary news discovery; primary claims stay tied to SEC evidence."""
     evidence: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
     started_at = monotonic()
     for symbol in [str(value).upper() for value in symbols[:limit]]:
-        url = f"https://news.google.com/rss/search?q={quote_plus(symbol + ' stock')}&hl=en-US&gl=US&ceid=US:en"
+        company = (company_names or {}).get(symbol, symbol)
+        query = f'"{company}"'
+        url = f"{GDELT_DOC_URL}?{urlencode({'query': query, 'mode': 'artlist', 'format': 'json', 'maxrecords': items_per_symbol, 'timespan': '7d'})}"
         if monotonic() - started_at >= NEWS_BUDGET_SECONDS:
-            evidence.append(evidence_record(symbol, "news", "News time budget reached", "No curated news was included before the connector time budget expired.", url, "Google News", status="unavailable"))
+            evidence.append(evidence_record(symbol, "news", "GDELT time budget reached", "No secondary news was included before the connector time budget expired.", url, "GDELT", status="unavailable", source_tier="secondary_discovery"))
             continue
         try:
-            root = ET.fromstring(_get_text(url))
-            for item in root.findall("./channel/item")[:items_per_symbol]:
-                evidence.append(evidence_record(symbol, "news", item.findtext("title", "Untitled"), item.findtext("description", ""), item.findtext("link", url), item.findtext("source", "Google News"), item.findtext("pubDate")))
+            payload = _get_json(url)
+            accepted = 0
+            for article in payload.get("articles", []):
+                article_url = str(article.get("url", ""))
+                domain = str(article.get("domain", urlparse(article_url).netloc)).lower().removeprefix("www.")
+                if not article_url or article_url in seen_urls or domain in GDELT_DENYLIST:
+                    continue
+                seen_urls.add(article_url)
+                evidence.append(evidence_record(symbol, "news", str(article.get("title", "Untitled")), str(article.get("socialimage", "")), article_url, domain or "GDELT", str(article.get("seendate", "")) or None, source_tier="secondary_discovery", source_domain=domain))
+                accepted += 1
+                if accepted >= items_per_symbol:
+                    break
+            if accepted == 0:
+                evidence.append(evidence_record(symbol, "news", "No eligible secondary articles", "GDELT returned no non-aggregated article for this company in the requested window.", url, "GDELT", status="unavailable", source_tier="secondary_discovery"))
+        except Exception as exc:
+            evidence.append(evidence_record(symbol, "news", "GDELT news unavailable", str(exc)[:160], url, "GDELT", status="unavailable", source_tier="secondary_discovery"))
+    return evidence
+
+
+def fetch_alpha_vantage_news(symbols: list[str]) -> list[dict[str, Any]]:
+    """Optional, disabled-by-default enrichment adapter requiring a separate key."""
+    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    if not api_key:
+        return []
+    evidence: list[dict[str, Any]] = []
+    for symbol in [str(value).upper() for value in symbols[:25]]:
+        public_url = "https://www.alphavantage.co/query?" + urlencode({"function": "NEWS_SENTIMENT", "tickers": symbol, "limit": 5})
+        url = public_url + "&" + urlencode({"apikey": api_key})
+        try:
+            payload = _get_json(url)
+            for item in payload.get("feed", [])[:5]:
+                evidence.append(evidence_record(symbol, "news", str(item.get("title", "Untitled")), str(item.get("summary", "")), str(item.get("url", public_url)), str(item.get("source", "Alpha Vantage")), str(item.get("time_published", "")) or None, source_tier="secondary_enrichment"))
         except Exception:
-            evidence.append(evidence_record(symbol, "news", "News feed unavailable", "No curated news was included for this symbol.", url, "Google News", status="unavailable"))
+            continue
     return evidence
 
 

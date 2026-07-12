@@ -3,11 +3,16 @@ from datetime import date
 import pandas as pd
 
 from stockpicker.data import load_lab_runs, save_lab_research_details, save_lab_research_snapshot, save_lab_run
-from stockpicker.lab import LabConfig, evidence_health, openai_api_key, optimize_decision, paper_orders, research_packet, validate_decision
+from stockpicker.lab import LabConfig, correlation_summary, entry_signal, evidence_health, openai_api_key, optimize_decision, paper_orders, prompt_for_packet, research_packet, validate_decision
+from stockpicker.research import fetch_gdelt_news
 
 
 def _candidates():
     return pd.DataFrame([{"symbol": "NVDA", "name": "NVIDIA", "theme": "AI", "latest_close": 100.0, "score": 90.0}])
+
+
+def _prices(symbol: str, values: list[float]) -> pd.DataFrame:
+    return pd.DataFrame({"symbol": symbol, "date": pd.bdate_range("2026-01-01", periods=len(values)), "open": values, "high": values, "low": values, "close": values, "volume": 1_000_000})
 
 
 def test_packet_is_point_in_time_and_bounded():
@@ -64,6 +69,46 @@ def test_packet_records_explicit_missing_research_without_fetching():
     assert packet["missing_evidence_policy"].startswith("No evidence")
     assert packet["candidates"][0]["combined_score"] == 90.0
     assert packet["connector_timings_ms"] == {}
+
+
+def test_correlation_packet_flags_high_pairs_with_enough_observations():
+    values = [100 + index for index in range(70)]
+    summary = correlation_summary(pd.concat([_prices("AAA", values), _prices("BBB", values)], ignore_index=True), ["AAA"], held_symbols=["BBB"])
+    assert summary["candidate_summary"][0]["daily_observations"] >= 40
+    assert summary["candidate_summary"][0]["average_correlation_to_held"] == 1.0
+
+
+def test_entry_signal_is_deterministic_and_does_not_require_model_prices():
+    result = entry_signal(_prices("AAA", [100 + index * 0.1 for index in range(250)]), "AAA", "Bull", "Up", "Up", "Up")
+    assert result["entry_label"] in {"Add", "Wait — confirm", "Wait — don't chase"}
+    assert result["preferred_entry_low"] < result["preferred_entry_high"]
+    assert entry_signal(_prices("AAA", [100] * 60), "AAA", "Bear", "Down", "Down", "Down")["entry_label"] == "Avoid"
+
+
+def test_validator_reports_correlation_warning_without_rejecting_valid_weights():
+    candidates = pd.DataFrame([{"symbol": "AAA", "sector": "One"}, {"symbol": "BBB", "sector": "Two"}])
+    packet = {"evidence": [], "correlations": {"high_correlation_pairs": [{"left": "AAA", "right": "BBB", "daily_correlation": 0.9}], "candidate_summary": []}}
+    result = validate_decision({"holdings": [{"symbol": "AAA", "weight": 0.4}, {"symbol": "BBB", "weight": 0.4}], "cash_weight": 0.2}, candidates, LabConfig(max_position=0.5), packet=packet)
+    assert result.valid
+    assert "high daily correlation" in " ".join(result.warnings)
+
+
+def test_prompt_forbids_model_invented_entry_levels():
+    assert "Do NOT return entry prices" in prompt_for_packet({"candidates": []}, LabConfig())
+
+
+def test_gdelt_evidence_is_secondary_and_deduplicated(monkeypatch):
+    import stockpicker.research as research
+
+    monkeypatch.setattr(research, "_get_json", lambda url: {"articles": [
+        {"title": "Eligible", "url": "https://example.com/story", "domain": "example.com", "seendate": "20260711T120000Z"},
+        {"title": "Duplicate", "url": "https://example.com/story", "domain": "example.com"},
+        {"title": "Syndicated", "url": "https://www.prnewswire.com/story", "domain": "prnewswire.com"},
+    ]})
+    rows = fetch_gdelt_news(["NVDA"], {"NVDA": "NVIDIA"})
+    available = [row for row in rows if row["status"] == "available"]
+    assert len(available) == 1
+    assert available[0]["source_tier"] == "secondary_discovery"
 
 
 def test_packet_freezes_supplied_security_master():

@@ -1108,7 +1108,7 @@ def main() -> None:
     all_seed = all_seed_universe(seed_frames)
     lab_uses_all_seeds = active_view == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
     lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
-    paper_symbols = set(paper_valuation_symbols(db_path=DEFAULT_DB_PATH)) if active_view == "Paper Portfolio" else set()
+    paper_symbols = set(paper_valuation_symbols(db_path=DEFAULT_DB_PATH)) if active_view in {"Paper Portfolio", "Chatgptfolio Lab"} else set()
     active_symbols = set(universe["symbol"]) if active_view not in {"Paper Portfolio", "System Health"} else set()
     symbols = sorted(active_symbols.union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
     refresh_key = st.session_state.get("refresh_key", 0)
@@ -1661,6 +1661,7 @@ def main() -> None:
         lab_ranked["rank"] = range(1, len(lab_ranked) + 1)
         lab_candidates = lab_ranked.head(30).copy()
         lab_state = st.session_state.get("lab_state", {})
+        lab_held_symbols = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH).get("symbol", pd.Series(dtype=str)).astype(str).str.upper().tolist()
 
         st.subheader("1. Run setup")
         lc1, lc2, lc3, lc4 = st.columns(4)
@@ -1694,7 +1695,7 @@ def main() -> None:
             st.error("The last OpenAI request was rejected. Replace the credential, then rerun; the key is never displayed here.")
 
         st.subheader("2. Research packet")
-        packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False)
+        packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False, prices=lab_signal_prices, held_symbols=lab_held_symbols)
         display_packet = lab_state.get("packet", packet)
         source_status, coverage_status, candidate_status = st.columns(3)
         source_status.metric("Price source", display_packet["coverage"]["prices"].title())
@@ -1709,6 +1710,13 @@ def main() -> None:
         if macro.get("series"):
             st.caption(f"Macro regime: **{macro.get('regime', 'unavailable')}**")
             st.dataframe(pd.DataFrame(macro["series"]).T, width="stretch", hide_index=False)
+        correlation_preview = display_packet.get("correlations", {})
+        if correlation_preview:
+            st.caption(f"Correlation coverage: {correlation_preview.get('daily_window', 50)} trading days / {correlation_preview.get('weekly_window', 26)} weeks. High-pair threshold: 0.80.")
+            high_pairs = pd.DataFrame(correlation_preview.get("high_correlation_pairs", []))
+            if not high_pairs.empty:
+                st.warning("High-correlation candidate pairs are a diversification warning, not an automatic exclusion.")
+                st.dataframe(high_pairs, width="stretch", hide_index=True)
         with st.expander("Immutable packet audit (raw JSON)"):
             st.json(display_packet)
 
@@ -1724,7 +1732,7 @@ def main() -> None:
 
         if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
             research_started_at = perf_counter()
-            packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research)
+            packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research, prices=lab_signal_prices, held_symbols=lab_held_symbols)
             record_timing("Research collection", research_started_at, "live refresh" if refresh_research else "packet-only", f"{len(packet.get('evidence', []))} evidence records")
             for source, duration_ms in packet.get("connector_timings_ms", {}).items():
                 record_duration(f"{str(source).title()} connector", float(duration_ms), "sequential public source", str(packet.get("coverage", {}).get(source, "unknown")))
@@ -1788,6 +1796,8 @@ def main() -> None:
                 st.error("Proposal is blocked: " + "; ".join(validation.errors))
             if decision.get("abstain_reason"):
                 st.warning("Model abstained: " + str(decision["abstain_reason"]))
+            for warning in validation.warnings:
+                st.warning("Diversification: " + warning)
             st.write(decision.get("portfolio_thesis", ""))
             optimization = decision.get("optimization", {})
             if optimization:
@@ -1796,7 +1806,24 @@ def main() -> None:
             if proposal.empty:
                 st.info("No holdings proposed.")
             else:
+                entry_lookup = {str(candidate.get("symbol", "")): candidate.get("entry", {}) for candidate in lab_state.get("packet", {}).get("candidates", [])}
+                proposal["entry_label"] = proposal["symbol"].map(lambda symbol: entry_lookup.get(str(symbol), {}).get("entry_label", "Unresolved"))
+                proposal["preferred_entry_zone"] = proposal["symbol"].map(lambda symbol: "–" if not entry_lookup.get(str(symbol), {}).get("preferred_entry_low") else f"${entry_lookup[str(symbol)]['preferred_entry_low']:.2f}–${entry_lookup[str(symbol)]['preferred_entry_high']:.2f}")
                 st.dataframe(proposal, width="stretch", hide_index=True)
+
+            st.subheader("Entry and diversification guidance")
+            deterministic = pd.DataFrame([
+                {"symbol": candidate.get("symbol"), **candidate.get("entry", {}), **{key: value for key, value in candidate.get("correlation", {}).items() if key in {"average_daily_correlation", "max_daily_correlation", "average_correlation_to_held", "cluster", "status"}}}
+                for candidate in lab_state.get("packet", {}).get("candidates", [])
+                if str(candidate.get("symbol", "")) in set(proposal.get("symbol", []))
+            ])
+            if not deterministic.empty:
+                st.dataframe(deterministic, width="stretch", hide_index=True)
+            correlations = lab_state.get("packet", {}).get("correlations", {})
+            matrix = pd.DataFrame(correlations.get("daily_matrix", {}))
+            if not matrix.empty:
+                matrix = matrix.reindex(index=matrix.columns, columns=matrix.columns)
+                st.plotly_chart(go.Figure(data=go.Heatmap(z=matrix.values, x=matrix.columns, y=matrix.index, zmin=-1, zmax=1, colorscale="RdBu", reversescale=True, colorbar={"title": "50D corr"})).update_layout(height=440, margin={"l": 10, "r": 10, "t": 20, "b": 10}), width="stretch", config={"displayModeBar": False})
 
             risk_items = []
             for flag in decision.get("portfolio_risks", []):
@@ -1819,12 +1846,12 @@ def main() -> None:
             for candidate in lab_state.get("packet", {}).get("candidates", []):
                 symbol = candidate.get("symbol", "")
                 with st.expander(f"{symbol} — score {candidate.get('combined_score', 'n/a')}"):
-                    st.json({key: candidate.get(key) for key in ["name", "seed_memberships", "sector", "technical_score", "fundamental_score", "combined_score", "fundamental_factors"] if key in candidate})
+                    st.json({key: candidate.get(key) for key in ["name", "seed_memberships", "sector", "technical_score", "fundamental_score", "combined_score", "fundamental_factors", "entry", "correlation"] if key in candidate})
                     rows = packet_evidence[packet_evidence["symbol"] == symbol] if not packet_evidence.empty and "symbol" in packet_evidence else pd.DataFrame()
                     if rows.empty:
                         st.warning("No refreshed company evidence was included; treat this candidate as unresolved.")
                     else:
-                        st.dataframe(rows[[column for column in ["category", "title", "publisher", "published_at", "status", "source_url"] if column in rows]], width="stretch", hide_index=True)
+                        st.dataframe(rows[[column for column in ["category", "title", "publisher", "source_tier", "source_domain", "published_at", "status", "source_url"] if column in rows]], width="stretch", hide_index=True)
 
             st.subheader("5. Paper rebalance")
             prior_weights = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)
@@ -1851,7 +1878,7 @@ def main() -> None:
                 if evidence.empty:
                     st.info("No refreshed external evidence was included in this run.")
                 else:
-                    st.dataframe(evidence[[column for column in ["symbol", "category", "title", "publisher", "published_at", "status", "source_url"] if column in evidence]], width="stretch", hide_index=True)
+                    st.dataframe(evidence[[column for column in ["symbol", "category", "title", "publisher", "source_tier", "source_domain", "published_at", "status", "source_url"] if column in evidence]], width="stretch", hide_index=True)
 
         st.subheader("6. Audit & performance")
         runs = load_lab_runs(DEFAULT_DB_PATH)
