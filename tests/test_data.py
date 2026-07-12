@@ -12,6 +12,7 @@ from stockpicker.data import (
     load_paper_benchmarks,
     load_paper_positions,
     rebuild_paper_nav,
+    paper_valuation_symbols,
     load_latest_portfolio_snapshot,
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
@@ -81,6 +82,15 @@ def test_approved_paper_rebalance_fills_next_open_and_builds_nav(tmp_path: Path)
     nav = load_paper_nav(portfolio_id, db_path)
     assert nav["nav"].iloc[-1] == pytest.approx(1_080.0)
     assert "TECHNICAL" in load_paper_benchmarks(portfolio_id, db_path)["symbol"].tolist()
+    valuation_symbols = paper_valuation_symbols(portfolio_id, db_path)
+    assert {"NVDA", "SPY", "QQQ", "GLD", "BTC-USD"}.issubset(valuation_symbols)
+    import duckdb
+    with duckdb.connect(str(db_path), read_only=True) as conn:
+        first_rebuilt_at = conn.execute("SELECT rebuilt_at FROM lab_paper_valuation_state WHERE portfolio_id = ?", [portfolio_id]).fetchone()[0]
+    rebuild_paper_nav(prices, portfolio_id, db_path)
+    with duckdb.connect(str(db_path), read_only=True) as conn:
+        second_rebuilt_at = conn.execute("SELECT rebuilt_at FROM lab_paper_valuation_state WHERE portfolio_id = ?", [portfolio_id]).fetchone()[0]
+    assert second_rebuilt_at == first_rebuilt_at
 
 
 def test_unapproved_run_cannot_change_paper_positions(tmp_path: Path):

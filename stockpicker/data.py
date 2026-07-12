@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from functools import lru_cache
 import json
 import hashlib
 from pathlib import Path
@@ -59,6 +60,7 @@ def _connect(db_path: Path = DEFAULT_DB_PATH):
     return duckdb.connect(str(db_path))
 
 
+@lru_cache(maxsize=32)
 def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
     """Create the local DuckDB cache tables if they do not exist."""
     with _connect(db_path) as conn:
@@ -231,6 +233,11 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
         """)
         conn.execute("ALTER TABLE lab_runs ADD COLUMN IF NOT EXISTS request_settings_json VARCHAR")
         conn.execute("ALTER TABLE lab_runs ADD COLUMN IF NOT EXISTS context_metadata_json VARCHAR")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_valuation_state (
+                portfolio_id INTEGER PRIMARY KEY, input_fingerprint VARCHAR, rebuilt_at TIMESTAMP
+            )
+        """)
 
 
 def _normalize_symbols(symbols: Iterable[str]) -> list[str]:
@@ -536,6 +543,7 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
             conn.execute("INSERT INTO lab_security_master SELECT * FROM _lab_master")
             conn.unregister("_lab_master")
         coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
+        diagnostics = packet.get("source_diagnostics", {}) if isinstance(packet, dict) else {}
         source_rows = []
         source_labels = {
             "prices": "Price cache",
@@ -553,7 +561,7 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
                 "severity": severity, "freshness": str(packet_quality.get("freshness", "current" if status == "available" else "unknown")),
                 "coverage": float(packet_quality.get("completeness", 1.0 if status == "available" else 0.0)),
                 "last_successful_at": now if status == "available" else None,
-                "failure_reason": None if status == "available" else "Connector returned no usable evidence; retry on the next refresh.",
+                "failure_reason": None if status == "available" else str(diagnostics.get(key, "Connector returned no usable evidence; retry on the next refresh.")),
                 "retry_state": "ready" if status == "available" else "retryable",
                 "quality_score": float(packet_quality.get("score", 100.0 if status == "available" else 0.0)),
             })
@@ -646,6 +654,60 @@ def paper_portfolio_weights(prices: pd.DataFrame, portfolio_id: int | None = Non
     total = float(valued["value"].sum() + cash)
     valued["weight"] = valued["value"] / total if total else 0.0
     return valued[["symbol", "weight"]]
+
+
+def paper_valuation_symbols(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> list[str]:
+    """Return the held, benchmark, and frozen technical-baseline symbols needed for valuation."""
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    symbols = {"SPY", "QQQ", "GLD", "BTC-USD"}
+    with _connect(db_path) as conn:
+        held = conn.execute(
+            """SELECT DISTINCT p.symbol FROM lab_paper_positions p
+               JOIN lab_paper_rebalances r ON p.rebalance_id = r.rebalance_id
+               WHERE r.portfolio_id = ? AND r.status = 'executed'""", [portfolio_id]
+        ).fetchall()
+        symbols.update(str(row[0]).upper() for row in held)
+        packets = conn.execute(
+            """SELECT r.status, r.config_json, r.decision_json, s.packet_json FROM lab_paper_rebalances r
+               JOIN lab_runs l ON r.run_id = l.run_id
+               JOIN lab_research_snapshots s ON l.packet_hash = s.snapshot_hash
+               WHERE r.portfolio_id = ? AND r.status IN ('executed', 'pending')""", [portfolio_id]
+        ).fetchall()
+    for status, config_json, decision_json, packet_json in packets:
+        try:
+            config, packet = json.loads(config_json or "{}"), json.loads(packet_json)
+            if status == "pending":
+                decision = json.loads(decision_json or "{}")
+                symbols.update(str(item.get("symbol", "")).upper() for item in decision.get("holdings", []) if item.get("symbol"))
+            else:
+                candidates = sorted(packet.get("candidates", []), key=lambda item: float(item.get("score", 0) or 0), reverse=True)
+                symbols.update(str(item.get("symbol", "")).upper() for item in candidates[: int(config.get("max_holdings", 15))] if item.get("symbol"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return sorted(symbols)
+
+
+def load_paper_portfolio_dashboard(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load the Paper Portfolio screen from one DuckDB connection."""
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        nav = conn.execute("SELECT date, nav, cash, drawdown, turnover FROM lab_paper_daily_nav WHERE portfolio_id = ? ORDER BY date", [portfolio_id]).fetchdf()
+        benchmarks = conn.execute("SELECT symbol, date, nav FROM lab_paper_benchmark_nav WHERE portfolio_id = ? ORDER BY date", [portfolio_id]).fetchdf()
+        rebalances = conn.execute(
+            """SELECT r.*, l.as_of_date, l.model, l.returned_model, l.packet_hash
+               FROM lab_paper_rebalances r LEFT JOIN lab_runs l ON r.run_id = l.run_id
+               WHERE r.portfolio_id = ? ORDER BY r.approved_at DESC""", [portfolio_id]
+        ).fetchdf()
+        positions = conn.execute(
+            """SELECT p.symbol, p.shares, p.average_cost, r.rebalance_id, r.effective_date, r.ending_cash
+               FROM lab_paper_rebalances r JOIN lab_paper_positions p ON r.rebalance_id = p.rebalance_id
+               WHERE r.portfolio_id = ? AND r.status = 'executed'
+                 AND r.rebalance_id = (SELECT max(rebalance_id) FROM lab_paper_rebalances WHERE portfolio_id = ? AND status = 'executed')
+               ORDER BY p.symbol""", [portfolio_id, portfolio_id]
+        ).fetchdf()
+    return nav, benchmarks, rebalances, positions
 
 
 def approve_paper_rebalance(
@@ -761,8 +823,27 @@ def execute_pending_paper_rebalances(prices: pd.DataFrame, db_path: Path = DEFAU
     return completed
 
 
-def rebuild_paper_nav(prices: pd.DataFrame, portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH, benchmarks: tuple[str, ...] = ("SPY", "QQQ", "GLD", "BTC-USD")) -> pd.DataFrame:
-    """Recalculate daily NAV from persisted executed positions and cached closes."""
+def _paper_valuation_fingerprint(frame: pd.DataFrame, rebalances: pd.DataFrame) -> str:
+    """Cheap, stable invalidation key for a portfolio valuation input set."""
+    price_summary = {
+        "rows": len(frame),
+        "symbols": sorted(frame["symbol"].astype(str).str.upper().unique().tolist()),
+        "start": str(pd.to_datetime(frame["date"], errors="coerce").min()),
+        "end": str(pd.to_datetime(frame["date"], errors="coerce").max()),
+        "close_sum": round(float(pd.to_numeric(frame["close"], errors="coerce").sum()), 6),
+    }
+    rebalance_summary = rebalances[[column for column in ["rebalance_id", "status", "effective_date", "ending_cash"] if column in rebalances]].astype(str).to_dict(orient="records")
+    return hashlib.sha256(json.dumps({"prices": price_summary, "rebalances": rebalance_summary}, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def rebuild_paper_nav(
+    prices: pd.DataFrame,
+    portfolio_id: int | None = None,
+    db_path: Path = DEFAULT_DB_PATH,
+    benchmarks: tuple[str, ...] = ("SPY", "QQQ", "GLD", "BTC-USD"),
+    force: bool = False,
+) -> pd.DataFrame:
+    """Recalculate daily NAV only when its price/rebalance inputs have changed."""
     portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
     init_database(db_path)
     frame = prices.copy()
@@ -774,6 +855,11 @@ def rebuild_paper_nav(prices: pd.DataFrame, portfolio_id: int | None = None, db_
     rebalances = rebalances[rebalances["status"] == "executed"].sort_values("effective_date") if not rebalances.empty else rebalances
     if rebalances.empty:
         return pd.DataFrame(columns=["date", "nav", "cash", "drawdown", "turnover"])
+    fingerprint = _paper_valuation_fingerprint(frame, rebalances)
+    with _connect(db_path) as conn:
+        state = conn.execute("SELECT input_fingerprint FROM lab_paper_valuation_state WHERE portfolio_id = ?", [portfolio_id]).fetchone()
+    if not force and state and state[0] == fingerprint:
+        return load_paper_nav(portfolio_id, db_path)
     positions_by_rebalance: dict[int, pd.DataFrame] = {}
     technical_targets: dict[int, list[str]] = {}
     with _connect(db_path) as conn:
@@ -849,6 +935,10 @@ def rebuild_paper_nav(prices: pd.DataFrame, portfolio_id: int | None = None, db_
             conn.register("_technical_nav", technical_frame)
             conn.execute("INSERT INTO lab_paper_benchmark_nav SELECT * FROM _technical_nav")
             conn.unregister("_technical_nav")
+        conn.execute(
+            "INSERT OR REPLACE INTO lab_paper_valuation_state VALUES (?, ?, ?)",
+            [portfolio_id, fingerprint, datetime.now(timezone.utc).replace(tzinfo=None)],
+        )
     return nav_frame[["date", "nav", "cash", "drawdown", "turnover"]]
 
 

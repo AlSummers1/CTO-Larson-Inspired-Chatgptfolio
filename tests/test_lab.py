@@ -63,6 +63,7 @@ def test_packet_records_explicit_missing_research_without_fetching():
     assert packet["coverage"]["fundamentals"] == "not_requested"
     assert packet["missing_evidence_policy"].startswith("No evidence")
     assert packet["candidates"][0]["combined_score"] == 90.0
+    assert packet["connector_timings_ms"] == {}
 
 
 def test_packet_freezes_supplied_security_master():

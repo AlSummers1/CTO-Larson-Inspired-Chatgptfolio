@@ -8,8 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import hashlib
+import io
 import json
 import os
+from time import monotonic
 from typing import Any, Protocol
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
@@ -22,6 +24,10 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 USER_AGENT = os.getenv("CHATGPTFOLIO_USER_AGENT", "Chatgptfolio research lab contact@example.invalid")
+CONNECTOR_TIMEOUT_SECONDS = 10
+MACRO_BUDGET_SECONDS = 30
+COMPANY_RESEARCH_BUDGET_SECONDS = 45
+NEWS_BUDGET_SECONDS = 30
 
 
 class EnrichmentProvider(Protocol):
@@ -54,13 +60,13 @@ def _now() -> str:
 
 def _get_json(url: str) -> dict[str, Any]:
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urlopen(request, timeout=20) as response:  # noqa: S310 - fixed public endpoints
+    with urlopen(request, timeout=CONNECTOR_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed public endpoints
         return json.loads(response.read().decode("utf-8"))
 
 
 def _get_text(url: str) -> str:
     request = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(request, timeout=20) as response:  # noqa: S310 - fixed/public RSS endpoints
+    with urlopen(request, timeout=CONNECTOR_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed/public RSS endpoints
         return response.read().decode("utf-8", errors="replace")
 
 
@@ -108,10 +114,14 @@ def fetch_macro_snapshot(as_of_date: date) -> tuple[dict[str, Any], list[dict[st
     series = {"FEDFUNDS": "Federal funds rate", "CPIAUCSL": "Consumer price index", "UNRATE": "Unemployment rate", "T10Y2Y": "10Y-2Y Treasury spread"}
     values: dict[str, Any] = {}
     evidence: list[dict[str, Any]] = []
+    started_at = monotonic()
     for code, label in series.items():
         url = FRED_URL.format(series=code)
+        if monotonic() - started_at >= MACRO_BUDGET_SECONDS:
+            values[code] = {"label": label, "status": "unavailable", "reason": "FRED connector time budget reached"}
+            continue
         try:
-            frame = pd.read_csv(url)
+            frame = pd.read_csv(io.StringIO(_get_text(url)))
             frame["observation_date"] = pd.to_datetime(frame["observation_date"], errors="coerce")
             frame = frame[frame["observation_date"].dt.date <= as_of_date].dropna()
             if frame.empty:
@@ -153,7 +163,11 @@ def fetch_sec_company_research(symbols: list[str], limit: int = 30) -> tuple[dic
         return {}, []
     output: dict[str, dict[str, Any]] = {}
     evidence: list[dict[str, Any]] = []
+    started_at = monotonic()
     for symbol in [str(value).upper() for value in symbols[:limit]]:
+        if monotonic() - started_at >= COMPANY_RESEARCH_BUDGET_SECONDS:
+            output[symbol] = {"status": "unavailable", "reason": "SEC connector time budget reached"}
+            continue
         cik = by_symbol.get(symbol)
         if not cik:
             continue
@@ -188,8 +202,12 @@ def fetch_sec_company_research(symbols: list[str], limit: int = 30) -> tuple[dic
 
 def fetch_news(symbols: list[str], limit: int = 20, items_per_symbol: int = 3) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
+    started_at = monotonic()
     for symbol in [str(value).upper() for value in symbols[:limit]]:
         url = f"https://news.google.com/rss/search?q={quote_plus(symbol + ' stock')}&hl=en-US&gl=US&ceid=US:en"
+        if monotonic() - started_at >= NEWS_BUDGET_SECONDS:
+            evidence.append(evidence_record(symbol, "news", "News time budget reached", "No curated news was included before the connector time budget expired.", url, "Google News", status="unavailable"))
+            continue
         try:
             root = ET.fromstring(_get_text(url))
             for item in root.findall("./channel/item")[:items_per_symbol]:

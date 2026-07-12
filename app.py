@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import date
 import json
+from time import perf_counter
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,11 +23,13 @@ from stockpicker.data import (
     load_portfolio_rebalance_log,
     load_lab_runs,
     load_paper_benchmarks,
+    load_paper_portfolio_dashboard,
     load_paper_nav,
     load_paper_positions,
     load_paper_rebalances,
     load_source_health,
     paper_portfolio_weights,
+    paper_valuation_symbols,
     rebuild_paper_nav,
     save_lab_paper_orders,
     save_lab_research_snapshot,
@@ -133,6 +136,35 @@ RRG_CONTROL_HELP = {
 
 
 st.set_page_config(page_title="CTO-Style Stock Ranking", layout="wide")
+
+
+def record_timing(name: str, started_at: float, cache_state: str = "not cached", details: str = "") -> float:
+    """Keep a local, non-secret performance trace for the System Health view."""
+    elapsed_ms = round((perf_counter() - started_at) * 1000, 1)
+    st.session_state.setdefault("performance_diagnostics", {})[name] = {
+        "operation": name,
+        "duration_ms": elapsed_ms,
+        "cache_state": cache_state,
+        "details": details,
+    }
+    return elapsed_ms
+
+
+def record_duration(name: str, duration_ms: float, cache_state: str = "not cached", details: str = "") -> None:
+    st.session_state.setdefault("performance_diagnostics", {})[name] = {
+        "operation": name,
+        "duration_ms": round(float(duration_ms), 1),
+        "cache_state": cache_state,
+        "details": details,
+    }
+
+
+def session_cache_state(name: str, signature: object) -> str:
+    """Describe whether this browser session reused the same cached-call key."""
+    key = f"_performance_key_{name}"
+    reused = st.session_state.get(key) == signature
+    st.session_state[key] = signature
+    return "session cache key reused" if reused else "new cache key"
 
 
 @st.cache_data
@@ -1051,83 +1083,6 @@ def main() -> None:
     use_relative_strength = st.sidebar.checkbox("Use relative strength in ranking", value=False)
     refresh_clicked = st.sidebar.button("Refresh cache")
 
-    manual_symbols = parse_ticker_text(ticker_text)
-    universe = build_active_universe(active_seed, manual_symbols)
-    rrg_seed_labels = selected_rrg_seed_labels_for_fetch(
-        st.session_state.get("rrg_view", "Stocks"),
-        st.session_state.get("rrg_seed_universes", default_rrg_seed_universes()),
-    )
-    portfolio_data_enabled = bool(st.session_state.get("portfolio_data_enabled", False))
-    portfolio_seed_labels_for_fetch = selected_portfolio_seed_labels_for_fetch(
-        st.session_state.get("portfolio_seed_universes", default_portfolio_seed_universes()),
-        portfolio_data_enabled,
-    )
-    rrg_seed_symbols = seed_symbols_for_labels(seed_frames, rrg_seed_labels)
-    portfolio_seed_symbols = seed_symbols_for_labels(seed_frames, portfolio_seed_labels_for_fetch)
-    all_seed = all_seed_universe(seed_frames)
-    selected_view = st.session_state.get("dashboard_view", "Rankings")
-    lab_uses_all_seeds = selected_view == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
-    lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
-    paper_symbols = {"SPY", "QQQ", "GLD", "BTC-USD"} if selected_view in {"Paper Portfolio", "System Health"} else set()
-    if paper_symbols:
-        paper_symbols.update(load_paper_positions(db_path=DEFAULT_DB_PATH).get("symbol", pd.Series(dtype=str)).astype(str))
-    symbols = sorted(set(universe["symbol"]).union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
-    refresh_key = st.session_state.get("refresh_key", 0)
-    if refresh_clicked:
-        refresh_key += 1
-        st.session_state["refresh_key"] = refresh_key
-
-    st.title("CTO-Style Stock Ranking")
-
-    try:
-        prices = cached_prices(tuple(symbols), refresh_key, refresh_clicked, years, str(DEFAULT_DB_PATH))
-    except RuntimeError as exc:
-        st.error(str(exc))
-        return
-
-    if prices.empty:
-        st.warning("No price data available yet. Refresh the cache after installing the required dependencies.")
-        return
-
-    # Approved rebalances are filled only after their next actual cached open.
-    # This call is idempotent and does nothing for unapproved model proposals.
-    execute_pending_paper_rebalances(prices, DEFAULT_DB_PATH)
-    paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
-    rebuild_paper_nav(prices, paper_id, DEFAULT_DB_PATH)
-
-    config = SignalConfig(larsson_history_weeks=larsson_history_weeks)
-    active_signal_symbols = set(universe["symbol"]).union({benchmark})
-    signal_prices = prices_for_symbols(prices, active_signal_symbols)
-    signals = cached_signal_table(signal_prices, benchmark, larsson_history_weeks)
-    signals = signals.merge(universe, on="symbol", how="left")
-    signals[["name", "theme", "notes"]] = signals[["name", "theme", "notes"]].fillna("")
-    signals[["fundamental_score", "catalyst_score"]] = signals[["fundamental_score", "catalyst_score"]].fillna(0.0)
-    ranked = rank_universe(signals, RankingConfig(use_relative_strength=use_relative_strength))
-
-    if require_200d:
-        ranked = ranked[ranked["pass_200d"] == True].copy()
-    if require_200w:
-        ranked = ranked[ranked["pass_200w"] == True].copy()
-    ranked = ranked.reset_index(drop=True)
-    ranked["rank"] = range(1, len(ranked) + 1)
-
-    benchmark_row = signals[signals["symbol"] == benchmark]
-    benchmark_regime = benchmark_row["larsson_regime"].iloc[0] if not benchmark_row.empty else "n/a"
-    benchmark_close = benchmark_row["latest_close"].iloc[0] if not benchmark_row.empty else float("nan")
-    benchmark_drawdown = benchmark_row["drawdown_52w"].iloc[0] if not benchmark_row.empty else float("nan")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Benchmark", benchmark)
-    c2.metric("Benchmark Regime", benchmark_regime)
-    c3.metric("Benchmark Close", money(benchmark_close))
-    c4.metric("Benchmark 52W Drawdown", pct(benchmark_drawdown))
-    c5.metric("Cache Freshness", latest_cache_timestamp(DEFAULT_DB_PATH))
-
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Symbols Ranked", len(ranked))
-    s2.metric("Passing 200D", int((ranked["pass_200d"] == True).sum()) if not ranked.empty else 0)
-    s3.metric("Passing 200W", int((ranked["pass_200w"] == True).sum()) if not ranked.empty else 0)
-
     if st.session_state.get("dashboard_view") not in VIEW_OPTIONS:
         st.session_state["dashboard_view"] = "Rankings"
     active_view = st.segmented_control(
@@ -1136,6 +1091,83 @@ def main() -> None:
         key="dashboard_view",
         label_visibility="collapsed",
     )
+
+    manual_symbols = parse_ticker_text(ticker_text)
+    universe = build_active_universe(active_seed, manual_symbols)
+    rrg_seed_labels = selected_rrg_seed_labels_for_fetch(
+        st.session_state.get("rrg_view", "Stocks"),
+        st.session_state.get("rrg_seed_universes", default_rrg_seed_universes()),
+    ) if active_view == "RRG" else []
+    portfolio_data_enabled = bool(st.session_state.get("portfolio_data_enabled", False))
+    portfolio_seed_labels_for_fetch = selected_portfolio_seed_labels_for_fetch(
+        st.session_state.get("portfolio_seed_universes", default_portfolio_seed_universes()),
+        portfolio_data_enabled,
+    ) if active_view == "Portfolio" else []
+    rrg_seed_symbols = seed_symbols_for_labels(seed_frames, rrg_seed_labels)
+    portfolio_seed_symbols = seed_symbols_for_labels(seed_frames, portfolio_seed_labels_for_fetch)
+    all_seed = all_seed_universe(seed_frames)
+    lab_uses_all_seeds = active_view == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
+    lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
+    paper_symbols = set(paper_valuation_symbols(db_path=DEFAULT_DB_PATH)) if active_view == "Paper Portfolio" else set()
+    active_symbols = set(universe["symbol"]) if active_view not in {"Paper Portfolio", "System Health"} else set()
+    symbols = sorted(active_symbols.union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
+    refresh_key = st.session_state.get("refresh_key", 0)
+    if refresh_clicked:
+        refresh_key += 1
+        st.session_state["refresh_key"] = refresh_key
+
+    st.title("CTO-Style Stock Ranking")
+
+    try:
+        price_started_at = perf_counter()
+        cached_before = cached_symbol_count(symbols, DEFAULT_DB_PATH)
+        price_cache_state = session_cache_state("prices", (tuple(symbols), refresh_key, years))
+        prices = cached_prices(tuple(symbols), refresh_key, refresh_clicked, years, str(DEFAULT_DB_PATH))
+        loaded_detail = "manual refresh" if refresh_clicked else ("warm local cache" if cached_before >= len(symbols) else f"loaded {max(0, len(symbols) - cached_before)} symbols")
+        record_timing("Price cache", price_started_at, price_cache_state, loaded_detail)
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+
+    if prices.empty:
+        st.warning("No price data available yet. Refresh the cache after installing the required dependencies.")
+        return
+
+    signals = pd.DataFrame()
+    ranked = pd.DataFrame()
+    needs_primary_signals = active_view not in {"Chatgptfolio Lab", "Paper Portfolio", "System Health"}
+    if needs_primary_signals:
+        config = SignalConfig(larsson_history_weeks=larsson_history_weeks)
+        active_signal_symbols = set(universe["symbol"]).union({benchmark})
+        signal_prices = prices_for_symbols(prices, active_signal_symbols)
+        signal_started_at = perf_counter()
+        signal_cache_state = session_cache_state("primary_signals", (tuple(sorted(active_signal_symbols)), benchmark, larsson_history_weeks, len(signal_prices), str(signal_prices["date"].max())))
+        signals = cached_signal_table(signal_prices, benchmark, larsson_history_weeks)
+        record_timing("Technical signals", signal_started_at, signal_cache_state, f"{len(active_signal_symbols)} symbols")
+        signals = signals.merge(universe, on="symbol", how="left")
+        signals[["name", "theme", "notes"]] = signals[["name", "theme", "notes"]].fillna("")
+        signals[["fundamental_score", "catalyst_score"]] = signals[["fundamental_score", "catalyst_score"]].fillna(0.0)
+        ranked = rank_universe(signals, RankingConfig(use_relative_strength=use_relative_strength))
+        if require_200d:
+            ranked = ranked[ranked["pass_200d"] == True].copy()
+        if require_200w:
+            ranked = ranked[ranked["pass_200w"] == True].copy()
+        ranked = ranked.reset_index(drop=True)
+        ranked["rank"] = range(1, len(ranked) + 1)
+        benchmark_row = signals[signals["symbol"] == benchmark]
+        benchmark_regime = benchmark_row["larsson_regime"].iloc[0] if not benchmark_row.empty else "n/a"
+        benchmark_close = benchmark_row["latest_close"].iloc[0] if not benchmark_row.empty else float("nan")
+        benchmark_drawdown = benchmark_row["drawdown_52w"].iloc[0] if not benchmark_row.empty else float("nan")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Benchmark", benchmark)
+        c2.metric("Benchmark Regime", benchmark_regime)
+        c3.metric("Benchmark Close", money(benchmark_close))
+        c4.metric("Benchmark 52W Drawdown", pct(benchmark_drawdown))
+        c5.metric("Cache Freshness", latest_cache_timestamp(DEFAULT_DB_PATH))
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Symbols Ranked", len(ranked))
+        s2.metric("Passing 200D", int((ranked["pass_200d"] == True).sum()) if not ranked.empty else 0)
+        s3.metric("Passing 200W", int((ranked["pass_200w"] == True).sum()) if not ranked.empty else 0)
 
     if active_view == "Rankings":
         display = ranked.copy()
@@ -1479,7 +1511,10 @@ def main() -> None:
                     "Some selected portfolio symbols are not cached yet. Use Refresh cache to fetch: "
                     + ", ".join(missing_portfolio_symbols[:20])
                 )
+            portfolio_signal_started_at = perf_counter()
+            portfolio_signal_cache_state = session_cache_state("portfolio_signals", (tuple(sorted(portfolio_symbols)), benchmark, larsson_history_weeks, len(portfolio_prices), str(portfolio_prices["date"].max())))
             portfolio_signals = cached_signal_table(portfolio_prices, benchmark, larsson_history_weeks)
+            record_timing("Portfolio technical ranking", portfolio_signal_started_at, portfolio_signal_cache_state, f"{len(portfolio_symbols)} symbols")
             portfolio_signals = portfolio_signals.merge(
                 portfolio_membership.drop_duplicates("symbol", keep="first"),
                 on="symbol",
@@ -1602,10 +1637,14 @@ def main() -> None:
     elif active_view == "Chatgptfolio Lab":
         st.title("Chatgptfolio Lab")
         st.caption("Auditable OpenAI research and paper trading. This does not place real trades or provide investment advice.")
+        paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
         lab_candidate_universe = st.radio("Candidate universe", ["All seed tickers", "Current selected seed"], horizontal=True, key="lab_candidate_universe", help="All seed tickers technically ranks the deduplicated union before research is bounded to the top 30.")
         lab_universe = all_seed if lab_candidate_universe == "All seed tickers" else universe
         lab_signal_prices = prices_for_symbols(prices, set(lab_universe["symbol"]).union({benchmark}))
+        lab_signal_started_at = perf_counter()
+        lab_signal_cache_state = session_cache_state("lab_signals", (lab_candidate_universe, tuple(sorted(lab_universe["symbol"])), benchmark, larsson_history_weeks, len(lab_signal_prices), str(lab_signal_prices["date"].max())))
         lab_signals = cached_signal_table(lab_signal_prices, benchmark, larsson_history_weeks)
+        record_timing("Lab technical ranking", lab_signal_started_at, lab_signal_cache_state, f"{len(lab_universe)} symbols")
         lab_signals = lab_signals.merge(lab_universe, on="symbol", how="left")
         for column in ["name", "theme", "notes"]:
             if column in lab_signals:
@@ -1684,7 +1723,11 @@ def main() -> None:
         st.dataframe(review[review_columns], width="stretch", hide_index=True)
 
         if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
+            research_started_at = perf_counter()
             packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research)
+            record_timing("Research collection", research_started_at, "live refresh" if refresh_research else "packet-only", f"{len(packet.get('evidence', []))} evidence records")
+            for source, duration_ms in packet.get("connector_timings_ms", {}).items():
+                record_duration(f"{str(source).title()} connector", float(duration_ms), "sequential public source", str(packet.get("coverage", {}).get(source, "unknown")))
             packet_hash = save_lab_research_snapshot(packet, DEFAULT_DB_PATH)
             save_lab_research_details(packet_hash, packet, DEFAULT_DB_PATH)
             readiness = preflight_packet(packet, credential)
@@ -1699,7 +1742,9 @@ def main() -> None:
                 st.error(f"Analysis was not run (record #{run_id}): " + "; ".join(readiness.errors))
                 return
             try:
+                model_started_at = perf_counter()
                 model_decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
+                record_timing("OpenAI proposal", model_started_at, "live API", selected_model)
                 previous_weights = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)
                 decision = optimize_decision(model_decision, lab_candidates, lab_config, previous_weights)
                 validation = validate_decision(decision, lab_candidates, lab_config, previous_weights, packet=packet)
@@ -1819,10 +1864,16 @@ def main() -> None:
     elif active_view == "Paper Portfolio":
         st.title("Paper Portfolio")
         st.caption("One approved, paper-only portfolio. Proposals do not affect it until you explicitly approve a rebalance.")
-        nav = load_paper_nav(paper_id, DEFAULT_DB_PATH)
-        benchmarks = load_paper_benchmarks(paper_id, DEFAULT_DB_PATH)
-        rebalances = load_paper_rebalances(paper_id, DEFAULT_DB_PATH)
-        positions = load_paper_positions(paper_id, DEFAULT_DB_PATH)
+        paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
+        valuation_started_at = perf_counter()
+        completed_rebalances = execute_pending_paper_rebalances(prices, DEFAULT_DB_PATH)
+        rebuild_paper_nav(prices, paper_id, DEFAULT_DB_PATH, force=bool(completed_rebalances))
+        record_timing(
+            "Paper NAV refresh", valuation_started_at,
+            "rebuilt after fill" if completed_rebalances else "valuation fingerprint reused when unchanged",
+            f"{len(completed_rebalances)} new fills",
+        )
+        nav, benchmarks, rebalances, positions = load_paper_portfolio_dashboard(paper_id, DEFAULT_DB_PATH)
         executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
         pending = rebalances[rebalances["status"] == "pending"] if not rebalances.empty else rebalances
         if nav.empty:
@@ -1878,6 +1929,12 @@ def main() -> None:
         status_one.metric("OpenAI credential", credential_status(latest_error).title())
         status_two.metric("Price cache", latest_cache_timestamp(DEFAULT_DB_PATH))
         status_three.metric("All-seeds readiness", f"{len(all_seed)} unique tickers")
+        st.subheader("Local performance diagnostics")
+        performance = st.session_state.get("performance_diagnostics", {})
+        if performance:
+            st.dataframe(pd.DataFrame(performance.values()), width="stretch", hide_index=True)
+        else:
+            st.info("Open a dashboard view or run a Lab analysis to collect local timing diagnostics for this browser session.")
         source_health = load_source_health(DEFAULT_DB_PATH)
         st.subheader("Source health")
         if source_health.empty:

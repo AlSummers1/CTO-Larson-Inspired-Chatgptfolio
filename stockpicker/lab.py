@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import subprocess
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -115,10 +116,19 @@ def research_packet(
     evidence: list[dict[str, Any]] = []
     macro: dict[str, Any] = {"as_of_date": as_of_date.isoformat(), "regime": "unavailable", "series": {}}
     source_status = {"prices": "available", "fundamentals": "not_requested", "events": "not_requested", "macro": "not_requested", "news": "not_requested"}
+    connector_timings: dict[str, float] = {}
+    source_diagnostics: dict[str, str] = {}
     if refresh_research:
+        started_at = perf_counter()
         macro, macro_evidence = fetch_macro_snapshot(as_of_date)
+        connector_timings["macro"] = round((perf_counter() - started_at) * 1000, 1)
+        started_at = perf_counter()
         fundamentals, sec_evidence = fetch_sec_company_research(symbols, config.research_limit)
+        connector_timings["fundamentals"] = round((perf_counter() - started_at) * 1000, 1)
+        connector_timings["events"] = connector_timings["fundamentals"]
+        started_at = perf_counter()
         news_evidence = fetch_news(symbols, config.research_limit)
+        connector_timings["news"] = round((perf_counter() - started_at) * 1000, 1)
         evidence = macro_evidence + sec_evidence + news_evidence
         source_status.update({
             "fundamentals": "available" if fundamentals else "unavailable",
@@ -126,6 +136,15 @@ def research_packet(
             "macro": "available" if macro.get("series") else "unavailable",
             "news": "available" if any(item.get("status") == "available" for item in news_evidence) else "unavailable",
         })
+        macro_failures = [str(item.get("reason", "")) for item in macro.get("series", {}).values() if isinstance(item, dict) and item.get("reason")]
+        sec_failures = [str(item.get("reason", "")) for item in fundamentals.values() if isinstance(item, dict) and item.get("reason")]
+        if macro_failures:
+            source_diagnostics["macro"] = macro_failures[0][:160]
+        if sec_failures:
+            source_diagnostics["fundamentals"] = sec_failures[0][:160]
+            source_diagnostics["events"] = sec_failures[0][:160]
+        if any(item.get("status") == "unavailable" for item in news_evidence):
+            source_diagnostics["news"] = "One or more RSS feeds were unavailable; retry on the next refresh."
     scores: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
     for _, row in facts.iterrows():
@@ -156,7 +175,8 @@ def research_packet(
             {"name": "FRED", "status": source_status["macro"]},
             {"name": "curated Google News RSS", "status": source_status["news"]},
         ],
-        "coverage": source_status, "source_quality": quality, "macro": macro, "candidates": enriched,
+        "coverage": source_status, "source_quality": quality, "connector_timings_ms": connector_timings,
+        "source_diagnostics": source_diagnostics, "macro": macro, "candidates": enriched,
         "candidate_scores": scores, "evidence": evidence,
         "security_master": (security_master if security_master is not None else facts)[[column for column in ["symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"] if column in (security_master if security_master is not None else facts)]].to_dict(orient="records"),
         "missing_evidence_policy": "No evidence may be invented. Abstain when the packet cannot support a claim.",
