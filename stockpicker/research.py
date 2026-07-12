@@ -10,7 +10,7 @@ from datetime import date, datetime, timezone
 import hashlib
 import json
 import os
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
@@ -22,6 +22,30 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 USER_AGENT = os.getenv("CHATGPTFOLIO_USER_AGENT", "Chatgptfolio research lab contact@example.invalid")
+
+
+class EnrichmentProvider(Protocol):
+    """Optional paid-data seam; no provider is enabled in the free local build."""
+
+    def fundamentals(self, symbols: list[str]) -> dict[str, dict[str, Any]]: ...
+
+    def earnings_calendar(self, symbols: list[str]) -> list[dict[str, Any]]: ...
+
+    def news(self, symbols: list[str]) -> list[dict[str, Any]]: ...
+
+
+@dataclass(frozen=True)
+class SourceQuality:
+    freshness: str
+    completeness: float
+    provenance: str
+    conflict: str = "none"
+
+    @property
+    def score(self) -> float:
+        penalties = {"none": 0, "possible": 15, "confirmed": 40}
+        freshness_score = {"current": 100, "stale": 65, "unknown": 35}.get(self.freshness, 35)
+        return max(0.0, round(freshness_score * self.completeness - penalties.get(self.conflict, 25), 1))
 
 
 def _now() -> str:

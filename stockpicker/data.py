@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import hashlib
 from pathlib import Path
@@ -179,6 +179,58 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
                 drawdown DOUBLE, turnover DOUBLE
             )
         """)
+        # The original lab tables are an immutable model/audit record.  These
+        # tables intentionally keep approved paper execution separate, so a
+        # rejected or merely exploratory model run can never alter portfolio
+        # performance.
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS lab_paper_portfolio_id_seq START 1")
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS lab_paper_rebalance_id_seq START 1")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_portfolios (
+                portfolio_id INTEGER DEFAULT nextval('lab_paper_portfolio_id_seq') PRIMARY KEY,
+                name VARCHAR UNIQUE, initial_capital DOUBLE, created_at TIMESTAMP, status VARCHAR
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_rebalances (
+                rebalance_id INTEGER DEFAULT nextval('lab_paper_rebalance_id_seq') PRIMARY KEY,
+                portfolio_id INTEGER, run_id INTEGER, approved_at TIMESTAMP, effective_date DATE,
+                status VARCHAR, starting_nav DOUBLE, ending_cash DOUBLE, config_json VARCHAR,
+                decision_json VARCHAR, note VARCHAR
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_fills (
+                rebalance_id INTEGER, symbol VARCHAR, action VARCHAR, quantity DOUBLE,
+                fill_price DOUBLE, notional DOUBLE, estimated_cost DOUBLE, filled_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_positions (
+                rebalance_id INTEGER, symbol VARCHAR, shares DOUBLE, average_cost DOUBLE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_daily_nav (
+                portfolio_id INTEGER, date DATE, nav DOUBLE, cash DOUBLE, drawdown DOUBLE,
+                turnover DOUBLE, PRIMARY KEY (portfolio_id, date)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_paper_benchmark_nav (
+                portfolio_id INTEGER, symbol VARCHAR, date DATE, nav DOUBLE,
+                PRIMARY KEY (portfolio_id, symbol, date)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lab_source_health (
+                snapshot_hash VARCHAR, source VARCHAR, status VARCHAR, severity VARCHAR,
+                freshness VARCHAR, coverage DOUBLE, last_successful_at TIMESTAMP,
+                failure_reason VARCHAR, retry_state VARCHAR, quality_score DOUBLE
+            )
+        """)
+        conn.execute("ALTER TABLE lab_runs ADD COLUMN IF NOT EXISTS request_settings_json VARCHAR")
+        conn.execute("ALTER TABLE lab_runs ADD COLUMN IF NOT EXISTS context_metadata_json VARCHAR")
 
 
 def _normalize_symbols(symbols: Iterable[str]) -> list[str]:
@@ -405,6 +457,20 @@ def load_fetch_log(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
     return frame
 
 
+def cached_symbol_count(symbols: Iterable[str], db_path: Path = DEFAULT_DB_PATH) -> int:
+    """Count symbols with any local history without triggering a network fetch."""
+    requested = _normalize_symbols(symbols)
+    if not requested:
+        return 0
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        frame = pd.DataFrame({"symbol": requested})
+        conn.register("_cache_symbols", frame)
+        count = conn.execute("SELECT count(DISTINCT p.symbol) FROM prices p JOIN _cache_symbols s ON p.symbol = s.symbol").fetchone()[0]
+        conn.unregister("_cache_symbols")
+    return int(count or 0)
+
+
 def latest_cache_timestamp(db_path: Path = DEFAULT_DB_PATH) -> str:
     """Return a compact cache freshness label for the dashboard."""
     log = load_fetch_log(db_path)
@@ -469,12 +535,38 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
             conn.register("_lab_master", frame[["snapshot_hash", "symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"]])
             conn.execute("INSERT INTO lab_security_master SELECT * FROM _lab_master")
             conn.unregister("_lab_master")
+        coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
+        source_rows = []
+        source_labels = {
+            "prices": "Price cache",
+            "fundamentals": "SEC EDGAR fundamentals",
+            "events": "SEC EDGAR filings",
+            "macro": "FRED macro",
+            "news": "Curated news RSS",
+        }
+        for key, label in source_labels.items():
+            status = str(coverage.get(key, "unresolved"))
+            packet_quality = packet.get("source_quality", {}).get(key, {}) if isinstance(packet, dict) else {}
+            severity = "low" if status == "available" else ("critical" if key == "prices" or status == "unavailable" else "unresolved")
+            source_rows.append({
+                "snapshot_hash": packet_hash, "source": label, "status": status,
+                "severity": severity, "freshness": str(packet_quality.get("freshness", "current" if status == "available" else "unknown")),
+                "coverage": float(packet_quality.get("completeness", 1.0 if status == "available" else 0.0)),
+                "last_successful_at": now if status == "available" else None,
+                "failure_reason": None if status == "available" else "Connector returned no usable evidence; retry on the next refresh.",
+                "retry_state": "ready" if status == "available" else "retryable",
+                "quality_score": float(packet_quality.get("score", 100.0 if status == "available" else 0.0)),
+            })
+        source_frame = pd.DataFrame(source_rows)
+        conn.register("_lab_source_health", source_frame)
+        conn.execute("INSERT INTO lab_source_health SELECT * FROM _lab_source_health")
+        conn.unregister("_lab_source_health")
 
 
 def save_lab_run(record: dict[str, object], db_path: Path = DEFAULT_DB_PATH) -> int:
     """Store an LLM decision without storing credentials."""
     init_database(db_path)
-    fields = ["created_at", "as_of_date", "benchmark", "model", "returned_model", "status", "packet_hash", "prompt_hash", "config_json", "response_json", "raw_response", "validation_json", "error_message"]
+    fields = ["created_at", "as_of_date", "benchmark", "model", "returned_model", "status", "packet_hash", "prompt_hash", "config_json", "response_json", "raw_response", "validation_json", "error_message", "request_settings_json", "context_metadata_json"]
     values = [record.get(field) for field in fields]
     values[0] = values[0] or datetime.now(timezone.utc).replace(tzinfo=None)
     with _connect(db_path) as conn:
@@ -501,6 +593,285 @@ def load_lab_runs(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
     init_database(db_path)
     with _connect(db_path) as conn:
         return conn.execute("SELECT run_id, created_at, as_of_date, benchmark, model, returned_model, status, packet_hash, error_message FROM lab_runs ORDER BY run_id DESC").fetchdf()
+
+
+def default_paper_portfolio(initial_capital: float = 100_000.0, db_path: Path = DEFAULT_DB_PATH) -> int:
+    """Return the one local paper portfolio, creating it lazily when needed."""
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT portfolio_id FROM lab_paper_portfolios WHERE name = 'Chatgptfolio Paper Portfolio'").fetchone()
+        if row:
+            return int(row[0])
+        return int(conn.execute(
+            "INSERT INTO lab_paper_portfolios (name, initial_capital, created_at, status) VALUES (?, ?, ?, ?) RETURNING portfolio_id",
+            ["Chatgptfolio Paper Portfolio", initial_capital, datetime.now(timezone.utc).replace(tzinfo=None), "active"],
+        ).fetchone()[0])
+
+
+def load_paper_rebalances(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute(
+            """SELECT r.*, l.as_of_date, l.model, l.returned_model, l.packet_hash
+               FROM lab_paper_rebalances r LEFT JOIN lab_runs l ON r.run_id = l.run_id
+               WHERE r.portfolio_id = ? ORDER BY r.approved_at DESC""", [portfolio_id]
+        ).fetchdf()
+
+
+def load_paper_positions(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute(
+            """SELECT p.symbol, p.shares, p.average_cost, r.rebalance_id, r.effective_date, r.ending_cash
+               FROM lab_paper_rebalances r JOIN lab_paper_positions p ON r.rebalance_id = p.rebalance_id
+               WHERE r.portfolio_id = ? AND r.status = 'executed'
+                 AND r.rebalance_id = (SELECT max(rebalance_id) FROM lab_paper_rebalances WHERE portfolio_id = ? AND status = 'executed')
+               ORDER BY p.symbol""", [portfolio_id, portfolio_id]
+        ).fetchdf()
+
+
+def paper_portfolio_weights(prices: pd.DataFrame, portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    """Value the latest executed positions at their most recent cached close."""
+    positions = load_paper_positions(portfolio_id, db_path)
+    if positions.empty:
+        return pd.DataFrame(columns=["symbol", "weight"])
+    latest = prices.copy()
+    latest["date"] = pd.to_datetime(latest["date"], errors="coerce")
+    latest = latest.sort_values("date").groupby("symbol", as_index=False).tail(1)
+    valued = positions.merge(latest[["symbol", "close"]], on="symbol", how="left")
+    valued["value"] = valued["shares"] * valued["close"].fillna(0.0)
+    cash = float(positions["ending_cash"].iloc[0] or 0.0)
+    total = float(valued["value"].sum() + cash)
+    valued["weight"] = valued["value"] / total if total else 0.0
+    return valued[["symbol", "weight"]]
+
+
+def approve_paper_rebalance(
+    run_id: int,
+    decision: dict[str, object],
+    config: dict[str, object],
+    as_of_date: date,
+    portfolio_id: int | None = None,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> int:
+    """Save an approval as pending; it fills only at the next cached market open."""
+    portfolio_id = portfolio_id or default_paper_portfolio(float(config.get("paper_capital", 100_000.0)), db_path)
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        existing = conn.execute("SELECT rebalance_id FROM lab_paper_rebalances WHERE run_id = ?", [run_id]).fetchone()
+        if existing:
+            return int(existing[0])
+        return int(conn.execute(
+            """INSERT INTO lab_paper_rebalances
+               (portfolio_id, run_id, approved_at, status, config_json, decision_json, note)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?) RETURNING rebalance_id""",
+            [portfolio_id, run_id, datetime.now(timezone.utc).replace(tzinfo=None), json.dumps(config, default=str), json.dumps(decision, default=str), f"Awaiting next open after {as_of_date.isoformat()}"],
+        ).fetchone()[0])
+
+
+def _latest_positions_for_rebalance(conn, portfolio_id: int) -> tuple[pd.DataFrame, float]:
+    prior = conn.execute(
+        "SELECT rebalance_id, ending_cash FROM lab_paper_rebalances WHERE portfolio_id = ? AND status = 'executed' ORDER BY rebalance_id DESC LIMIT 1",
+        [portfolio_id],
+    ).fetchone()
+    if not prior:
+        capital = conn.execute("SELECT initial_capital FROM lab_paper_portfolios WHERE portfolio_id = ?", [portfolio_id]).fetchone()
+        return pd.DataFrame(columns=["symbol", "shares", "average_cost"]), float(capital[0] if capital else 0.0)
+    rows = conn.execute("SELECT symbol, shares, average_cost FROM lab_paper_positions WHERE rebalance_id = ?", [prior[0]]).fetchdf()
+    return rows, float(prior[1] or 0.0)
+
+
+def execute_pending_paper_rebalances(prices: pd.DataFrame, db_path: Path = DEFAULT_DB_PATH) -> list[int]:
+    """Convert pending approvals into next-open simulated fills using supplied cache data.
+
+    No fill is manufactured when a required open is unavailable; the approval remains
+    pending until a subsequent cache refresh supplies the actual next trading day.
+    """
+    init_database(db_path)
+    frame = prices.copy()
+    if frame.empty:
+        return []
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
+    frame["symbol"] = frame["symbol"].astype(str).str.upper()
+    completed: list[int] = []
+    with _connect(db_path) as conn:
+        pending = conn.execute(
+            """SELECT r.rebalance_id, r.portfolio_id, r.decision_json, r.config_json, l.as_of_date
+               FROM lab_paper_rebalances r JOIN lab_runs l ON r.run_id = l.run_id
+               WHERE r.status = 'pending' ORDER BY r.rebalance_id"""
+        ).fetchdf()
+        for _, rebalance in pending.iterrows():
+            decision = json.loads(rebalance["decision_json"])
+            config = json.loads(rebalance["config_json"])
+            targets = {str(item["symbol"]).upper(): float(item["weight"]) for item in decision.get("holdings", [])}
+            previous, cash = _latest_positions_for_rebalance(conn, int(rebalance["portfolio_id"]))
+            symbols = set(targets).union(set(previous.get("symbol", pd.Series(dtype=str)).astype(str).str.upper()))
+            after = pd.to_datetime(rebalance["as_of_date"]).date()
+            eligible_days = frame[(frame["symbol"].isin(symbols)) & (frame["date"] > after)] if symbols else pd.DataFrame()
+            if eligible_days.empty:
+                continue
+            fill_date = min(eligible_days["date"])
+            opens = frame[(frame["date"] == fill_date) & (frame["symbol"].isin(symbols))].set_index("symbol")
+            if any(symbol not in opens.index or pd.isna(opens.loc[symbol, "open"]) for symbol in symbols):
+                continue
+            prior_shares = dict(zip(previous.get("symbol", []), previous.get("shares", [])))
+            nav = cash + sum(float(prior_shares.get(symbol, 0.0)) * float(opens.loc[symbol, "open"]) for symbol in symbols)
+            if nav <= 0:
+                continue
+            slippage = float(config.get("slippage_bps", 0.0)) / 10_000
+            commission = float(config.get("commission_bps", 0.0)) / 10_000
+            desired = {symbol: nav * weight / float(opens.loc[symbol, "open"]) for symbol, weight in targets.items()}
+            fills: list[dict[str, object]] = []
+            # Sells first: this makes cash accounting conservative and deterministic.
+            for symbol in sorted(symbols):
+                old, new = float(prior_shares.get(symbol, 0.0)), float(desired.get(symbol, 0.0))
+                if new >= old - 1e-10:
+                    continue
+                quantity, price = old - new, float(opens.loc[symbol, "open"]) * (1 - slippage)
+                notional, cost = quantity * price, quantity * price * commission
+                cash += notional - cost
+                fills.append({"symbol": symbol, "action": "SELL", "quantity": quantity, "fill_price": price, "notional": notional, "estimated_cost": cost})
+            buys = [(symbol, max(0.0, float(desired.get(symbol, 0.0)) - float(prior_shares.get(symbol, 0.0)))) for symbol in sorted(targets)]
+            buy_cost = sum(qty * float(opens.loc[symbol, "open"]) * (1 + slippage + commission) for symbol, qty in buys)
+            scale = min(1.0, cash / buy_cost) if buy_cost > 0 else 1.0
+            for symbol, quantity in buys:
+                quantity *= max(0.0, scale)
+                if quantity <= 1e-10:
+                    continue
+                price = float(opens.loc[symbol, "open"]) * (1 + slippage)
+                notional, cost = quantity * price, quantity * price * commission
+                cash -= notional + cost
+                fills.append({"symbol": symbol, "action": "BUY", "quantity": quantity, "fill_price": price, "notional": notional, "estimated_cost": cost})
+            final_shares = {symbol: float(desired.get(symbol, 0.0)) if symbol in targets else 0.0 for symbol in symbols}
+            if scale < 1.0:
+                for symbol, quantity in buys:
+                    final_shares[symbol] = float(prior_shares.get(symbol, 0.0)) + quantity * scale
+            conn.execute("DELETE FROM lab_paper_fills WHERE rebalance_id = ?", [int(rebalance["rebalance_id"])])
+            conn.execute("DELETE FROM lab_paper_positions WHERE rebalance_id = ?", [int(rebalance["rebalance_id"])])
+            for fill in fills:
+                conn.execute("INSERT INTO lab_paper_fills VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [int(rebalance["rebalance_id"]), *fill.values(), datetime.combine(fill_date, datetime.min.time())])
+            for symbol, shares in final_shares.items():
+                if shares > 1e-10:
+                    price = float(opens.loc[symbol, "open"])
+                    conn.execute("INSERT INTO lab_paper_positions VALUES (?, ?, ?, ?)", [int(rebalance["rebalance_id"]), symbol, shares, price])
+            conn.execute("UPDATE lab_paper_rebalances SET status = 'executed', effective_date = ?, starting_nav = ?, ending_cash = ?, note = ? WHERE rebalance_id = ?", [fill_date, nav, max(0.0, cash), "Filled at next cached market open", int(rebalance["rebalance_id"])])
+            completed.append(int(rebalance["rebalance_id"]))
+    return completed
+
+
+def rebuild_paper_nav(prices: pd.DataFrame, portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH, benchmarks: tuple[str, ...] = ("SPY", "QQQ", "GLD", "BTC-USD")) -> pd.DataFrame:
+    """Recalculate daily NAV from persisted executed positions and cached closes."""
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    frame = prices.copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["date", "nav", "cash", "drawdown", "turnover"])
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
+    frame["symbol"] = frame["symbol"].astype(str).str.upper()
+    rebalances = load_paper_rebalances(portfolio_id, db_path)
+    rebalances = rebalances[rebalances["status"] == "executed"].sort_values("effective_date") if not rebalances.empty else rebalances
+    if rebalances.empty:
+        return pd.DataFrame(columns=["date", "nav", "cash", "drawdown", "turnover"])
+    positions_by_rebalance: dict[int, pd.DataFrame] = {}
+    technical_targets: dict[int, list[str]] = {}
+    with _connect(db_path) as conn:
+        for _, rebalance in rebalances.iterrows():
+            rebalance_id = int(rebalance["rebalance_id"])
+            positions_by_rebalance[int(rebalance_id)] = conn.execute("SELECT symbol, shares FROM lab_paper_positions WHERE rebalance_id = ?", [int(rebalance_id)]).fetchdf()
+            packet_row = conn.execute(
+                """SELECT s.packet_json FROM lab_runs l JOIN lab_research_snapshots s ON l.packet_hash = s.snapshot_hash
+                   WHERE l.run_id = ?""", [int(rebalance["run_id"])]
+            ).fetchone()
+            if packet_row:
+                packet = json.loads(packet_row[0])
+                config = json.loads(rebalance["config_json"] or "{}")
+                candidates = sorted(packet.get("candidates", []), key=lambda item: float(item.get("score", item.get("technical_score", 0)) or 0), reverse=True)
+                technical_targets[rebalance_id] = [str(item.get("symbol", "")).upper() for item in candidates[: int(config.get("max_holdings", 15))] if item.get("symbol")]
+    start = pd.to_datetime(rebalances["effective_date"].min()).date()
+    days = sorted(frame.loc[frame["date"] >= start, "date"].dropna().unique())
+    closes = frame.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index().ffill()
+    rows = []
+    technical_rows = []
+    technical_shares: dict[str, float] = {}
+    technical_cash = 0.0
+    technical_rebalance_id: int | None = None
+    for current_day in days:
+        eligible = rebalances[pd.to_datetime(rebalances["effective_date"]).dt.date <= current_day]
+        if eligible.empty or current_day not in closes.index:
+            continue
+        current = eligible.iloc[-1]
+        holdings = positions_by_rebalance[int(current["rebalance_id"])]
+        values = 0.0
+        for _, holding in holdings.iterrows():
+            if holding["symbol"] in closes.columns and pd.notna(closes.loc[current_day, holding["symbol"]]):
+                values += float(holding["shares"]) * float(closes.loc[current_day, holding["symbol"]])
+        nav = values + float(current["ending_cash"] or 0.0)
+        rows.append({"portfolio_id": portfolio_id, "date": current_day, "nav": nav, "cash": float(current["ending_cash"] or 0.0), "turnover": 0.0})
+        rebalance_id = int(current["rebalance_id"])
+        if technical_rebalance_id != rebalance_id:
+            if technical_shares:
+                technical_cash += sum(float(shares) * float(closes.loc[current_day, symbol]) for symbol, shares in technical_shares.items() if symbol in closes.columns and pd.notna(closes.loc[current_day, symbol]))
+            else:
+                technical_cash = float(current["starting_nav"] or nav)
+            targets = [symbol for symbol in technical_targets.get(rebalance_id, []) if symbol in closes.columns and pd.notna(closes.loc[current_day, symbol])]
+            technical_shares = {symbol: technical_cash / len(targets) / float(closes.loc[current_day, symbol]) for symbol in targets} if targets else {}
+            technical_cash = 0.0 if targets else technical_cash
+            technical_rebalance_id = rebalance_id
+        technical_value = technical_cash + sum(float(shares) * float(closes.loc[current_day, symbol]) for symbol, shares in technical_shares.items() if symbol in closes.columns and pd.notna(closes.loc[current_day, symbol]))
+        if technical_value > 0:
+            technical_rows.append({"portfolio_id": portfolio_id, "symbol": "TECHNICAL", "date": current_day, "nav": technical_value})
+    nav_frame = pd.DataFrame(rows)
+    if nav_frame.empty:
+        return pd.DataFrame(columns=["date", "nav", "cash", "drawdown", "turnover"])
+    nav_frame["drawdown"] = nav_frame["nav"] / nav_frame["nav"].cummax() - 1.0
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM lab_paper_daily_nav WHERE portfolio_id = ?", [portfolio_id])
+        conn.register("_paper_nav", nav_frame[["portfolio_id", "date", "nav", "cash", "drawdown", "turnover"]])
+        conn.execute("INSERT INTO lab_paper_daily_nav SELECT * FROM _paper_nav")
+        conn.unregister("_paper_nav")
+        conn.execute("DELETE FROM lab_paper_benchmark_nav WHERE portfolio_id = ?", [portfolio_id])
+        initial_nav = float(nav_frame.iloc[0]["nav"])
+        for symbol in benchmarks:
+            if symbol not in closes.columns:
+                continue
+            series = closes[symbol].reindex(nav_frame["date"]).dropna()
+            if series.empty:
+                continue
+            normalized = initial_nav * series / float(series.iloc[0])
+            benchmark_frame = pd.DataFrame({"portfolio_id": portfolio_id, "symbol": symbol, "date": normalized.index, "nav": normalized.values})
+            conn.register("_benchmark_nav", benchmark_frame)
+            conn.execute("INSERT INTO lab_paper_benchmark_nav SELECT * FROM _benchmark_nav")
+            conn.unregister("_benchmark_nav")
+        if technical_rows:
+            technical_frame = pd.DataFrame(technical_rows)
+            conn.register("_technical_nav", technical_frame)
+            conn.execute("INSERT INTO lab_paper_benchmark_nav SELECT * FROM _technical_nav")
+            conn.unregister("_technical_nav")
+    return nav_frame[["date", "nav", "cash", "drawdown", "turnover"]]
+
+
+def load_paper_nav(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute("SELECT date, nav, cash, drawdown, turnover FROM lab_paper_daily_nav WHERE portfolio_id = ? ORDER BY date", [portfolio_id]).fetchdf()
+
+
+def load_paper_benchmarks(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute("SELECT symbol, date, nav FROM lab_paper_benchmark_nav WHERE portfolio_id = ? ORDER BY date", [portfolio_id]).fetchdf()
+
+
+def load_source_health(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute("""SELECT * EXCLUDE (row_num) FROM (
+            SELECT *, row_number() OVER (PARTITION BY source ORDER BY last_successful_at DESC NULLS LAST) AS row_num
+            FROM lab_source_health) WHERE row_num = 1 ORDER BY source""").fetchdf()
 
 
 def save_portfolio_snapshot(

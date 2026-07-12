@@ -9,7 +9,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from stockpicker.data import (
+    approve_paper_rebalance,
+    cached_symbol_count,
     DEFAULT_DB_PATH,
+    default_paper_portfolio,
+    execute_pending_paper_rebalances,
     fetch_price_history,
     latest_cache_timestamp,
     load_fetch_log,
@@ -17,6 +21,13 @@ from stockpicker.data import (
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
     load_lab_runs,
+    load_paper_benchmarks,
+    load_paper_nav,
+    load_paper_positions,
+    load_paper_rebalances,
+    load_source_health,
+    paper_portfolio_weights,
+    rebuild_paper_nav,
     save_lab_paper_orders,
     save_lab_research_snapshot,
     save_lab_research_details,
@@ -57,10 +68,13 @@ from stockpicker.lab import (
     SEVERITY_COLORS,
     SEVERITY_ORDER,
     config_payload as lab_config_payload,
+    credential_status,
     decision_hash,
     evidence_health,
     paper_orders,
     optimize_decision,
+    packet_context_metadata,
+    preflight_packet,
     research_packet,
     severity_counts,
     validate_decision,
@@ -110,7 +124,7 @@ DEFAULT_RRG_SEED_UNIVERSES = [
     "Cybersecurity Universe",
 ]
 DEFAULT_PORTFOLIO_SEED_UNIVERSES = DEFAULT_RRG_SEED_UNIVERSES
-VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Chatgptfolio Lab", "Data Audit"]
+VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Chatgptfolio Lab", "Paper Portfolio", "System Health", "Data Audit"]
 RRG_CONTROL_HELP = {
     "tail_weeks": "How many recent weekly RRG points to draw as each ticker's rotation trail.",
     "ratio_smoothing": "Weeks used to smooth the stock-vs-benchmark relative trend. Higher values make the RS Ratio less jumpy.",
@@ -1051,9 +1065,13 @@ def main() -> None:
     rrg_seed_symbols = seed_symbols_for_labels(seed_frames, rrg_seed_labels)
     portfolio_seed_symbols = seed_symbols_for_labels(seed_frames, portfolio_seed_labels_for_fetch)
     all_seed = all_seed_universe(seed_frames)
-    lab_uses_all_seeds = st.session_state.get("dashboard_view") == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
+    selected_view = st.session_state.get("dashboard_view", "Rankings")
+    lab_uses_all_seeds = selected_view == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
     lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
-    symbols = sorted(set(universe["symbol"]).union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union({benchmark}))
+    paper_symbols = {"SPY", "QQQ", "GLD", "BTC-USD"} if selected_view in {"Paper Portfolio", "System Health"} else set()
+    if paper_symbols:
+        paper_symbols.update(load_paper_positions(db_path=DEFAULT_DB_PATH).get("symbol", pd.Series(dtype=str)).astype(str))
+    symbols = sorted(set(universe["symbol"]).union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
     refresh_key = st.session_state.get("refresh_key", 0)
     if refresh_clicked:
         refresh_key += 1
@@ -1070,6 +1088,12 @@ def main() -> None:
     if prices.empty:
         st.warning("No price data available yet. Refresh the cache after installing the required dependencies.")
         return
+
+    # Approved rebalances are filled only after their next actual cached open.
+    # This call is idempotent and does nothing for unapproved model proposals.
+    execute_pending_paper_rebalances(prices, DEFAULT_DB_PATH)
+    paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
+    rebuild_paper_nav(prices, paper_id, DEFAULT_DB_PATH)
 
     config = SignalConfig(larsson_history_weeks=larsson_history_weeks)
     active_signal_symbols = set(universe["symbol"]).union({benchmark})
@@ -1602,7 +1626,8 @@ def main() -> None:
         st.subheader("1. Run setup")
         lc1, lc2, lc3, lc4 = st.columns(4)
         selected_model = lc1.selectbox("OpenAI model", MODEL_OPTIONS, index=MODEL_OPTIONS.index(DEFAULT_MODEL), help="Model choice is recorded per run; there is no automatic fallback.")
-        as_of_date = lc2.date_input("As-of date", value=date.today(), max_value=date.today(), help="Current version analyses the locally cached, current-market candidate table. Historical replay is a future extension.")
+        as_of_date = date.today()
+        lc2.metric("Research date", as_of_date.isoformat(), help="Live Lab decisions are current-date research only. Historical replay stays disabled until every source has an archived point-in-time packet.")
         paper_capital = lc3.number_input("Paper capital ($)", min_value=1_000.0, value=100_000.0, step=10_000.0)
         slippage_bps = lc4.number_input("Slippage (bps)", min_value=0.0, value=5.0, step=1.0)
         lc5, lc6, lc7 = st.columns(3)
@@ -1613,6 +1638,21 @@ def main() -> None:
         lab_max_sector = lc8.slider("Maximum sector exposure (%)", 10, 80, 40, step=5) / 100
         refresh_research = lc9.checkbox("Refresh public research evidence", value=True, help="Fetches bounded SEC, FRED, and curated-news evidence only when an analysis is run.")
         lab_config = LabConfig(model=selected_model, max_holdings=lab_max_holdings, max_position=lab_max_position, max_sector_exposure=lab_max_sector, paper_capital=paper_capital, slippage_bps=slippage_bps, commission_bps=commission_bps)
+
+        st.subheader("Connection & Data Health")
+        last_model_error = st.session_state.get("lab_credential_error")
+        credential = credential_status(last_model_error)
+        health_one, health_two, health_three = st.columns(3)
+        health_one.metric("OpenAI credential", credential.title())
+        cached_all_seed_count = cached_symbol_count(all_seed["symbol"], DEFAULT_DB_PATH) if lab_candidate_universe == "All seed tickers" else 0
+        health_two.metric("All-seeds cache", f"{cached_all_seed_count}/{len(all_seed)} tickers" if lab_candidate_universe == "All seed tickers" else "Focused seed")
+        health_three.metric("Price cache", latest_cache_timestamp(DEFAULT_DB_PATH))
+        if lab_candidate_universe == "All seed tickers":
+            st.caption("First all-seeds load may take longer; subsequent runs reuse the local DuckDB price cache.")
+        if credential == "missing":
+            st.warning("No credential is available to the app. The key is never displayed or stored in DuckDB.")
+        elif credential == "rejected":
+            st.error("The last OpenAI request was rejected. Replace the credential, then rerun; the key is never displayed here.")
 
         st.subheader("2. Research packet")
         packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False)
@@ -1647,10 +1687,22 @@ def main() -> None:
             packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research)
             packet_hash = save_lab_research_snapshot(packet, DEFAULT_DB_PATH)
             save_lab_research_details(packet_hash, packet, DEFAULT_DB_PATH)
+            readiness = preflight_packet(packet, credential)
+            if not readiness.valid:
+                run_id = save_lab_run({
+                    "as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model,
+                    "status": "preflight_blocked", "packet_hash": packet_hash,
+                    "config_json": json.dumps(lab_config_payload(lab_config)),
+                    "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)),
+                    "error_message": "; ".join(readiness.errors),
+                }, DEFAULT_DB_PATH)
+                st.error(f"Analysis was not run (record #{run_id}): " + "; ".join(readiness.errors))
+                return
             try:
                 model_decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
-                decision = optimize_decision(model_decision, lab_candidates, lab_config)
-                validation = validate_decision(decision, lab_candidates, lab_config, packet=packet)
+                previous_weights = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)
+                decision = optimize_decision(model_decision, lab_candidates, lab_config, previous_weights)
+                validation = validate_decision(decision, lab_candidates, lab_config, previous_weights, packet=packet)
                 status = "proposal_ready" if validation.valid else "validation_failed"
                 run_id = save_lab_run({
                     "as_of_date": as_of_date,
@@ -1661,14 +1713,18 @@ def main() -> None:
                     "packet_hash": packet_hash,
                     "prompt_hash": decision_hash({"packet": packet, "config": lab_config_payload(lab_config)}),
                     "config_json": json.dumps(lab_config_payload(lab_config)),
+                    "request_settings_json": json.dumps({"reasoning_effort": "high" if selected_model == DEFAULT_MODEL else "medium", "response_format": "strict_json_schema"}),
+                    "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)),
                     "response_json": json.dumps({"model_decision": model_decision, "optimized_decision": decision}),
                     "raw_response": raw_response,
                     "validation_json": json.dumps({"valid": validation.valid, "errors": validation.errors, "warnings": validation.warnings}),
                 }, DEFAULT_DB_PATH)
-                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model, "packet": packet}
+                st.session_state.pop("lab_credential_error", None)
+                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model, "packet": packet, "config": lab_config_payload(lab_config), "as_of_date": as_of_date.isoformat()}
                 st.rerun()
             except Exception as exc:
-                run_id = save_lab_run({"as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model, "status": "model_failed", "packet_hash": packet_hash, "config_json": json.dumps(lab_config_payload(lab_config)), "error_message": str(exc)}, DEFAULT_DB_PATH)
+                st.session_state["lab_credential_error"] = str(exc)
+                run_id = save_lab_run({"as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model, "status": "model_failed", "packet_hash": packet_hash, "config_json": json.dumps(lab_config_payload(lab_config)), "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)), "error_message": str(exc)}, DEFAULT_DB_PATH)
                 st.error(f"Analysis was not run (record #{run_id}): {exc}")
 
         st.subheader("4. ChatGPT proposal")
@@ -1726,7 +1782,8 @@ def main() -> None:
                         st.dataframe(rows[[column for column in ["category", "title", "publisher", "published_at", "status", "source_url"] if column in rows]], width="stretch", hide_index=True)
 
             st.subheader("5. Paper rebalance")
-            orders = paper_orders(pd.DataFrame(), decision, lab_config)
+            prior_weights = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)
+            orders = paper_orders(prior_weights, decision, lab_config)
             if orders.empty:
                 st.info("No paper orders proposed.")
             else:
@@ -1734,9 +1791,12 @@ def main() -> None:
                 for column in ["previous_weight", "target_weight"]:
                     orders_display[column] = orders_display[column] * 100
                 st.dataframe(orders_display, width="stretch", hide_index=True)
-                if validation.valid and st.button("Approve and save paper orders"):
-                    save_lab_paper_orders(int(lab_state["run_id"]), orders, DEFAULT_DB_PATH)
-                    st.success("Paper orders saved. No broker was contacted.")
+                if validation.valid and st.button("Approve paper rebalance", type="primary"):
+                    rebalance_id = approve_paper_rebalance(
+                        int(lab_state["run_id"]), decision, lab_state.get("config", lab_config_payload(lab_config)),
+                        date.fromisoformat(lab_state.get("as_of_date", as_of_date.isoformat())), paper_id, DEFAULT_DB_PATH,
+                    )
+                    st.success(f"Paper rebalance #{rebalance_id} approved. It will fill at the next cached market open; no broker was contacted.")
 
             with st.expander("Decision audit"):
                 st.json(decision)
@@ -1754,7 +1814,82 @@ def main() -> None:
             st.info("No prior lab runs saved.")
         else:
             st.dataframe(runs, width="stretch", hide_index=True)
-            st.caption("Runs preserve an immutable packet and source timestamps. Historical replay must reject evidence published or fetched after its as-of date.")
+            st.caption("Runs preserve immutable packets and source timestamps. Historical model replay is disabled until every source is archived with point-in-time availability metadata.")
+
+    elif active_view == "Paper Portfolio":
+        st.title("Paper Portfolio")
+        st.caption("One approved, paper-only portfolio. Proposals do not affect it until you explicitly approve a rebalance.")
+        nav = load_paper_nav(paper_id, DEFAULT_DB_PATH)
+        benchmarks = load_paper_benchmarks(paper_id, DEFAULT_DB_PATH)
+        rebalances = load_paper_rebalances(paper_id, DEFAULT_DB_PATH)
+        positions = load_paper_positions(paper_id, DEFAULT_DB_PATH)
+        executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
+        pending = rebalances[rebalances["status"] == "pending"] if not rebalances.empty else rebalances
+        if nav.empty:
+            st.info("No approved rebalance has filled yet. Approve a validated Lab proposal; it will become active at the next cached market open.")
+            if not pending.empty:
+                st.dataframe(pending[[column for column in ["rebalance_id", "run_id", "approved_at", "status", "note"] if column in pending]], width="stretch", hide_index=True)
+        else:
+            start_nav, latest_nav = float(nav.iloc[0]["nav"]), float(nav.iloc[-1]["nav"])
+            daily_returns = nav["nav"].pct_change().dropna()
+            turnover = float(nav["turnover"].sum())
+            metric_one, metric_two, metric_three, metric_four = st.columns(4)
+            metric_one.metric("NAV", money(latest_nav), pct(latest_nav / start_nav - 1.0))
+            metric_two.metric("Max drawdown", pct(float(nav["drawdown"].min())))
+            metric_three.metric("Approved periods", len(executed))
+            metric_four.metric("Daily hit rate", pct(float((daily_returns > 0).mean())) if not daily_returns.empty else "n/a")
+            if len(executed) < 3:
+                st.warning("Insufficient history: fewer than three approved rebalance periods. This dashboard makes no outperformance claim from a short sample.")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=nav["date"], y=nav["nav"], name="Chatgptfolio paper", line={"width": 3, "color": "#2563eb"}))
+            if not benchmarks.empty:
+                for symbol, rows in benchmarks.groupby("symbol"):
+                    fig.add_trace(go.Scatter(x=rows["date"], y=rows["nav"], name=str(symbol), line={"width": 1.5}))
+            if not executed.empty:
+                markers = nav.merge(executed[["effective_date", "rebalance_id"]], left_on="date", right_on="effective_date", how="inner")
+                if not markers.empty:
+                    fig.add_trace(go.Scatter(x=markers["date"], y=markers["nav"], mode="markers", name="Approved update", marker={"size": 10, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
+            fig.update_layout(height=430, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Portfolio value")
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+            summary_one, summary_two, summary_three, summary_four = st.columns(4)
+            summary_one.metric("Turnover", pct(turnover))
+            summary_two.metric("Average holding period", f"{max(0, len(nav) // max(1, len(executed)))} market days")
+            summary_three.metric("Concentration", pct(float((paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)["weight"] ** 2).sum())) if not positions.empty else "n/a")
+            source_health = load_source_health(DEFAULT_DB_PATH)
+            summary_four.metric("Source coverage", pct(float((source_health["status"] == "available").mean())) if not source_health.empty else "n/a")
+            st.caption("TECHNICAL is an equal-weight, deterministic baseline rebuilt from each approved run's frozen technical ranking. It uses the same rebalance dates but no model reasoning.")
+        st.subheader("Current positions and cash")
+        if positions.empty:
+            st.info("No filled positions yet.")
+        else:
+            st.dataframe(positions, width="stretch", hide_index=True)
+        st.subheader("Approved rebalance timeline")
+        if rebalances.empty:
+            st.info("No approvals recorded.")
+        else:
+            st.dataframe(rebalances[[column for column in ["rebalance_id", "run_id", "approved_at", "effective_date", "status", "starting_nav", "ending_cash", "model", "packet_hash", "note"] if column in rebalances]], width="stretch", hide_index=True)
+
+    elif active_view == "System Health":
+        st.title("System Health")
+        st.caption("Local-only readiness and data provenance. API secrets are never displayed, logged, or stored in DuckDB.")
+        latest_runs = load_lab_runs(DEFAULT_DB_PATH)
+        latest_error = str(latest_runs.iloc[0]["error_message"]) if not latest_runs.empty and pd.notna(latest_runs.iloc[0].get("error_message")) else None
+        status_one, status_two, status_three = st.columns(3)
+        status_one.metric("OpenAI credential", credential_status(latest_error).title())
+        status_two.metric("Price cache", latest_cache_timestamp(DEFAULT_DB_PATH))
+        status_three.metric("All-seeds readiness", f"{len(all_seed)} unique tickers")
+        source_health = load_source_health(DEFAULT_DB_PATH)
+        st.subheader("Source health")
+        if source_health.empty:
+            st.info("No research packet has been stored yet. Run a refreshed Lab analysis to establish connector health.")
+        else:
+            st.dataframe(source_health, width="stretch", hide_index=True)
+        st.subheader("Model attempt diagnostics")
+        if latest_runs.empty:
+            st.info("No model attempts have been recorded.")
+        else:
+            st.dataframe(latest_runs, width="stretch", hide_index=True)
+        st.caption("Historical model replay is intentionally unavailable. Only frozen packets with evidence available before the decision date may later be used for replay.")
 
     elif active_view == "Data Audit":
         st.subheader("Fetch Log")

@@ -20,7 +20,7 @@ from .research import fetch_macro_snapshot, fetch_news, fetch_sec_company_resear
 
 MODEL_OPTIONS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 DEFAULT_MODEL = "gpt-5.5"
-PROMPT_VERSION = "chatgptfolio-v2-research-lab"
+PROMPT_VERSION = "chatgptfolio-v3-reliability-lab"
 SEVERITY_ORDER = ("critical", "high", "medium", "low", "unresolved")
 SEVERITY_COLORS = {"critical": "#dc2626", "high": "#f97316", "medium": "#eab308", "low": "#22c55e", "unresolved": "#94a3b8"}
 
@@ -44,6 +44,40 @@ class ValidationResult:
     valid: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def credential_status(last_error: str | None = None) -> str:
+    """Return a safe UI status without probing or exposing an API key."""
+    if last_error and ("401" in last_error or "invalid_api_key" in last_error):
+        return "rejected"
+    return "ready" if openai_api_key() else "missing"
+
+
+def packet_context_metadata(packet: dict[str, object], config: LabConfig) -> dict[str, object]:
+    """A reproducible context estimate, not a billing estimate or secret trace."""
+    serialized = json.dumps(packet, default=str, separators=(",", ":"))
+    return {
+        "packet_characters": len(serialized),
+        "estimated_input_tokens": round(len(serialized) / 4),
+        "candidate_count": len(packet.get("candidates", [])),
+        "evidence_count": len(packet.get("evidence", [])),
+        "model": config.model,
+        "prompt_version": PROMPT_VERSION,
+    }
+
+
+def preflight_packet(packet: dict[str, object], credential: str) -> ValidationResult:
+    """Stop before an API call if basic decision inputs cannot be supported."""
+    errors: list[str] = []
+    coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
+    if credential != "ready":
+        errors.append("OpenAI credential is not ready")
+    if coverage.get("prices") != "available" or not packet.get("candidates"):
+        errors.append("required price coverage is unavailable")
+    research_available = sum(coverage.get(key) == "available" for key in ("fundamentals", "events", "macro", "news"))
+    if research_available == 0:
+        errors.append("minimum external evidence coverage is unavailable; refresh research before running")
+    return ValidationResult(not errors, errors)
 
 
 def _liquidity_score(row: pd.Series) -> float:
@@ -108,6 +142,10 @@ def research_packet(
     enriched.sort(key=lambda item: float(item.get("combined_score", 0)), reverse=True)
     for column in facts.select_dtypes(include=["datetime", "datetimetz"]).columns:
         facts[column] = facts[column].astype(str)
+    quality = {}
+    for key, status in source_status.items():
+        available = status == "available"
+        quality[key] = {"freshness": "current" if available else "unknown", "completeness": 1.0 if available else 0.0, "provenance": "primary" if key in {"fundamentals", "events", "macro"} else "curated", "conflict": "none", "score": 100 if available else 0}
     return {
         "packet_version": PROMPT_VERSION,
         "as_of_date": as_of_date.isoformat(), "benchmark": benchmark,
@@ -118,7 +156,7 @@ def research_packet(
             {"name": "FRED", "status": source_status["macro"]},
             {"name": "curated Google News RSS", "status": source_status["news"]},
         ],
-        "coverage": source_status, "macro": macro, "candidates": enriched,
+        "coverage": source_status, "source_quality": quality, "macro": macro, "candidates": enriched,
         "candidate_scores": scores, "evidence": evidence,
         "security_master": (security_master if security_master is not None else facts)[[column for column in ["symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"] if column in (security_master if security_master is not None else facts)]].to_dict(orient="records"),
         "missing_evidence_policy": "No evidence may be invented. Abstain when the packet cannot support a claim.",
@@ -160,7 +198,8 @@ def evidence_health(packet: dict[str, object]) -> list[dict[str, str]]:
         elif status == "not_requested": severity = "unresolved"
         elif status == "available": severity = "low"
         else: severity = "medium"
-        output.append({"source": label, "status": status, "severity": severity})
+        quality = packet.get("source_quality", {}).get(key, {}) if isinstance(packet, dict) else {}
+        output.append({"source": label, "status": status, "severity": severity, "freshness": str(quality.get("freshness", "unknown")), "quality_score": str(quality.get("score", 0))})
     return output
 
 

@@ -4,12 +4,21 @@ import pandas as pd
 import pytest
 
 from stockpicker.data import (
+    approve_paper_rebalance,
+    default_paper_portfolio,
+    execute_pending_paper_rebalances,
     init_database,
+    load_paper_nav,
+    load_paper_benchmarks,
+    load_paper_positions,
+    rebuild_paper_nav,
     load_latest_portfolio_snapshot,
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
     read_cached_prices,
     save_portfolio_snapshot,
+    save_lab_run,
+    save_lab_research_snapshot,
     write_prices,
 )
 
@@ -34,6 +43,52 @@ def test_duckdb_cache_round_trip(tmp_path: Path):
     cached = read_cached_prices(["NVDA"], db_path)
     assert len(cached) == 2
     assert cached["close"].tolist() == [10.0, 11.0]
+
+
+def test_approved_paper_rebalance_fills_next_open_and_builds_nav(tmp_path: Path):
+    db_path = tmp_path / "market_data.duckdb"
+    packet_hash = save_lab_research_snapshot(
+        {"as_of_date": "2026-01-02", "candidates": [{"symbol": "NVDA", "score": 99.0}]}, db_path
+    )
+    run_id = save_lab_run(
+        {"as_of_date": "2026-01-02", "benchmark": "SPY", "model": "gpt-5.5", "status": "proposal_ready", "packet_hash": packet_hash}, db_path
+    )
+    portfolio_id = default_paper_portfolio(1_000.0, db_path)
+    rebalance_id = approve_paper_rebalance(
+        run_id,
+        {"holdings": [{"symbol": "NVDA", "weight": 0.8}], "cash_weight": 0.2},
+        {"paper_capital": 1_000.0, "slippage_bps": 0.0, "commission_bps": 0.0},
+        pd.Timestamp("2026-01-02").date(),
+        portfolio_id,
+        db_path,
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["NVDA", "NVDA", "SPY", "SPY"],
+            "date": pd.to_datetime(["2026-01-02", "2026-01-03", "2026-01-02", "2026-01-03"]),
+            "open": [10.0, 10.0, 100.0, 100.0],
+            "high": [10.0, 11.0, 100.0, 101.0],
+            "low": [10.0, 10.0, 100.0, 100.0],
+            "close": [10.0, 11.0, 100.0, 101.0],
+            "volume": [1_000_000] * 4,
+        }
+    )
+    assert execute_pending_paper_rebalances(prices, db_path) == [rebalance_id]
+    positions = load_paper_positions(portfolio_id, db_path)
+    assert positions["symbol"].tolist() == ["NVDA"]
+    assert positions["shares"].iloc[0] == pytest.approx(80.0)
+    rebuild_paper_nav(prices, portfolio_id, db_path)
+    nav = load_paper_nav(portfolio_id, db_path)
+    assert nav["nav"].iloc[-1] == pytest.approx(1_080.0)
+    assert "TECHNICAL" in load_paper_benchmarks(portfolio_id, db_path)["symbol"].tolist()
+
+
+def test_unapproved_run_cannot_change_paper_positions(tmp_path: Path):
+    db_path = tmp_path / "market_data.duckdb"
+    default_paper_portfolio(1_000.0, db_path)
+    prices = pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
+    assert execute_pending_paper_rebalances(prices, db_path) == []
+    assert load_paper_positions(db_path=db_path).empty
 
 
 def test_portfolio_snapshot_round_trip(tmp_path: Path):
