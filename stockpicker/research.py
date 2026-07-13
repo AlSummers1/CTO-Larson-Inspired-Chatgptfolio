@@ -6,11 +6,14 @@ record is normalized into auditable evidence before it reaches a model prompt.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+import getpass
 import hashlib
 import io
 import json
 import os
+import platform
+import subprocess
 from time import monotonic
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
@@ -29,6 +32,8 @@ COMPANY_RESEARCH_BUDGET_SECONDS = 45
 NEWS_BUDGET_SECONDS = 30
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 GDELT_DENYLIST = {"prnewswire.com", "businesswire.com", "globenewswire.com", "accesswire.com", "news.google.com", "finance.yahoo.com", "reddit.com", "x.com", "twitter.com"}
+ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
+ALPHA_VANTAGE_KEYCHAIN_SERVICE = "chatgptfolio-alpha-vantage"
 
 
 class EnrichmentProvider(Protocol):
@@ -69,6 +74,26 @@ def _get_text(url: str) -> str:
     request = Request(url, headers={"User-Agent": USER_AGENT})
     with urlopen(request, timeout=CONNECTOR_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed/public RSS endpoints
         return response.read().decode("utf-8", errors="replace")
+
+
+def alpha_vantage_api_key() -> str | None:
+    """Resolve optional Alpha Vantage credentials without logging or persisting them."""
+    environment_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    if environment_key:
+        return environment_key
+    if platform.system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", getpass.getuser(), "-s", ALPHA_VANTAGE_KEYCHAIN_SERVICE, "-w"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
 def evidence_record(
@@ -236,22 +261,86 @@ def fetch_gdelt_news(symbols: list[str], company_names: dict[str, str] | None = 
     return evidence
 
 
-def fetch_alpha_vantage_news(symbols: list[str]) -> list[dict[str, Any]]:
-    """Optional, disabled-by-default enrichment adapter requiring a separate key."""
-    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+def fetch_alpha_vantage_news(
+    symbols: list[str],
+    as_of_date: date,
+    items_per_symbol: int = 5,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch one bounded, ticker-linked Alpha Vantage news batch.
+
+    A single multi-ticker request avoids consuming a request per candidate.  The
+    credential is used only in the outgoing request; persisted evidence retains
+    a public URL with the key removed.
+    """
+    api_key = alpha_vantage_api_key()
     if not api_key:
-        return []
+        return [], "credential not configured"
+    requested = list(dict.fromkeys(str(value).upper() for value in symbols if str(value).strip()))
+    if not requested:
+        return [], None
+    requested = requested[:30]
+    start = as_of_date - timedelta(days=7)
+    public_params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": ",".join(requested),
+        "time_from": start.strftime("%Y%m%dT0000"),
+        "limit": min(200, max(25, len(requested) * items_per_symbol)),
+    }
+    public_url = f"{ALPHA_VANTAGE_URL}?{urlencode(public_params)}"
+    request_url = f"{public_url}&{urlencode({'apikey': api_key})}"
+    try:
+        payload = _get_json(request_url)
+    except Exception:
+        return [], "request failed; retry on the next refresh"
+    provider_message = str(payload.get("Note") or payload.get("Information") or payload.get("Error Message") or "").strip()
+    if provider_message:
+        return [], provider_message[:160]
+    feed = payload.get("feed", [])
+    if not isinstance(feed, list):
+        return [], "response did not contain a news feed"
     evidence: list[dict[str, Any]] = []
-    for symbol in [str(value).upper() for value in symbols[:25]]:
-        public_url = "https://www.alphavantage.co/query?" + urlencode({"function": "NEWS_SENTIMENT", "tickers": symbol, "limit": 5})
-        url = public_url + "&" + urlencode({"apikey": api_key})
-        try:
-            payload = _get_json(url)
-            for item in payload.get("feed", [])[:5]:
-                evidence.append(evidence_record(symbol, "news", str(item.get("title", "Untitled")), str(item.get("summary", "")), str(item.get("url", public_url)), str(item.get("source", "Alpha Vantage")), str(item.get("time_published", "")) or None, source_tier="secondary_enrichment"))
-        except Exception:
+    seen_urls: set[str] = set()
+    counts: dict[str, int] = {symbol: 0 for symbol in requested}
+    for article in feed:
+        if not isinstance(article, dict):
             continue
-    return evidence
+        article_url = str(article.get("url", ""))
+        if not article_url or article_url in seen_urls:
+            continue
+        article_symbols = {
+            str(item.get("ticker", "")).upper()
+            for item in article.get("ticker_sentiment", [])
+            if isinstance(item, dict)
+        }.intersection(requested)
+        if not article_symbols:
+            continue
+        seen_urls.add(article_url)
+        for symbol in sorted(article_symbols):
+            if counts[symbol] >= items_per_symbol:
+                continue
+            sentiment = next(
+                (item for item in article.get("ticker_sentiment", []) if isinstance(item, dict) and str(item.get("ticker", "")).upper() == symbol),
+                {},
+            )
+            sentiment_label = str(sentiment.get("ticker_sentiment_label", ""))
+            sentiment_score = str(sentiment.get("ticker_sentiment_score", ""))
+            summary = str(article.get("summary", ""))
+            if sentiment_label:
+                summary = f"Alpha Vantage sentiment: {sentiment_label} ({sentiment_score}). {summary}".strip()
+            evidence.append(
+                evidence_record(
+                    symbol,
+                    "news",
+                    str(article.get("title", "Untitled")),
+                    summary,
+                    article_url,
+                    str(article.get("source", "Alpha Vantage")),
+                    str(article.get("time_published", "")) or None,
+                    source_tier="secondary_enrichment",
+                )
+            )
+            counts[symbol] += 1
+    return evidence, None if evidence else "no ticker-linked articles in the requested window"
 
 
 def fundamental_score(fundamentals: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:

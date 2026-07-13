@@ -4,7 +4,7 @@ import pandas as pd
 
 from stockpicker.data import load_lab_runs, save_lab_research_details, save_lab_research_snapshot, save_lab_run
 from stockpicker.lab import LabConfig, allowed_packet_references, correlation_summary, decision_schema_for_packet, entry_signal, evidence_health, openai_api_key, optimize_decision, paper_orders, prompt_for_packet, research_packet, validate_decision
-from stockpicker.research import fetch_gdelt_news
+from stockpicker.research import alpha_vantage_api_key, fetch_alpha_vantage_news, fetch_gdelt_news
 
 
 def _candidates():
@@ -109,6 +109,65 @@ def test_gdelt_evidence_is_secondary_and_deduplicated(monkeypatch):
     available = [row for row in rows if row["status"] == "available"]
     assert len(available) == 1
     assert available[0]["source_tier"] == "secondary_discovery"
+
+
+def test_alpha_vantage_news_uses_one_keyless_audit_url_and_ticker_links(monkeypatch):
+    import stockpicker.research as research
+
+    requested_urls = []
+    monkeypatch.setattr(research, "alpha_vantage_api_key", lambda: "test-key")
+    monkeypatch.setattr(research, "_get_json", lambda url: requested_urls.append(url) or {"feed": [
+        {
+            "title": "Semiconductor demand update",
+            "summary": "A relevant update.",
+            "url": "https://publisher.example/article",
+            "source": "Publisher",
+            "time_published": "20260713T1000",
+            "ticker_sentiment": [
+                {"ticker": "NVDA", "ticker_sentiment_label": "Bullish", "ticker_sentiment_score": "0.4"},
+                {"ticker": "AMD", "ticker_sentiment_label": "Neutral", "ticker_sentiment_score": "0.0"},
+            ],
+        }
+    ]})
+
+    rows, diagnostic = fetch_alpha_vantage_news(["NVDA", "AMD"], date(2026, 7, 13))
+
+    assert diagnostic is None
+    assert len(requested_urls) == 1
+    assert "test-key" in requested_urls[0]
+    assert {row["symbol"] for row in rows} == {"NVDA", "AMD"}
+    assert all(row["source_tier"] == "secondary_enrichment" for row in rows)
+    assert all("test-key" not in str(row["source_url"]) for row in rows)
+
+
+def test_alpha_vantage_key_reads_macos_keychain_when_environment_is_missing(monkeypatch):
+    import stockpicker.research as research
+
+    class Result:
+        returncode = 0
+        stdout = "keychain-key\n"
+
+    monkeypatch.delenv("ALPHA_VANTAGE_API_KEY", raising=False)
+    monkeypatch.setattr(research.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(research.subprocess, "run", lambda *args, **kwargs: Result())
+    assert alpha_vantage_api_key() == "keychain-key"
+
+
+def test_refreshed_packet_includes_alpha_vantage_source_health(monkeypatch):
+    import stockpicker.lab as lab
+
+    alpha_evidence = [{"evidence_id": "alpha-1", "symbol": "NVDA", "category": "news", "title": "Update", "summary": "Test", "source_url": "https://example.com", "publisher": "Publisher", "published_at": None, "fetched_at": "2026-07-13T12:00:00+00:00", "content_hash": "alpha", "status": "available", "source_tier": "secondary_enrichment", "source_domain": "example.com"}]
+    monkeypatch.setattr(lab, "fetch_macro_snapshot", lambda as_of: ({"series": {"FEDFUNDS": {"value": 4.0}}}, []))
+    monkeypatch.setattr(lab, "fetch_sec_company_research", lambda symbols, limit: ({"NVDA": {}}, []))
+    monkeypatch.setattr(lab, "fetch_gdelt_news", lambda symbols, names, limit: [])
+    monkeypatch.setattr(lab, "alpha_vantage_api_key", lambda: "configured")
+    monkeypatch.setattr(lab, "fetch_alpha_vantage_news", lambda symbols, as_of: (alpha_evidence, None))
+
+    packet = research_packet(_candidates(), date(2026, 7, 13), "SPY", refresh_research=True)
+
+    assert packet["coverage"]["alpha_vantage_news"] == "available"
+    assert packet["sources"][-1]["name"] == "Alpha Vantage ticker-linked news"
+    assert packet["evidence"][-1]["evidence_id"] == "alpha-1"
 
 
 def test_packet_freezes_supplied_security_master():

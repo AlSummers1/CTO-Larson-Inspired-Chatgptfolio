@@ -553,6 +553,7 @@ def save_lab_research_details(packet_hash: str, packet: dict[str, object], db_pa
             "events": "SEC EDGAR filings",
             "macro": "FRED macro",
             "news": "GDELT news discovery",
+            "alpha_vantage_news": "Alpha Vantage ticker-linked news",
         }
         for key, label in source_labels.items():
             status = str(coverage.get(key, "unresolved"))

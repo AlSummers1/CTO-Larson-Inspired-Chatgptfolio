@@ -17,7 +17,7 @@ from typing import Any
 
 import pandas as pd
 
-from .research import fetch_macro_snapshot, fetch_gdelt_news, fetch_sec_company_research, fundamental_score
+from .research import alpha_vantage_api_key, fetch_alpha_vantage_news, fetch_macro_snapshot, fetch_gdelt_news, fetch_sec_company_research, fundamental_score
 
 MODEL_OPTIONS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 DEFAULT_MODEL = "gpt-5.5"
@@ -187,7 +187,7 @@ def research_packet(
     fundamentals: dict[str, dict[str, Any]] = {}
     evidence: list[dict[str, Any]] = []
     macro: dict[str, Any] = {"as_of_date": as_of_date.isoformat(), "regime": "unavailable", "series": {}}
-    source_status = {"prices": "available", "fundamentals": "not_requested", "events": "not_requested", "macro": "not_requested", "news": "not_requested"}
+    source_status = {"prices": "available", "fundamentals": "not_requested", "events": "not_requested", "macro": "not_requested", "news": "not_requested", "alpha_vantage_news": "not_configured"}
     connector_timings: dict[str, float] = {}
     source_diagnostics: dict[str, str] = {}
     if refresh_research:
@@ -202,12 +202,20 @@ def research_packet(
         names = {str(row.get("symbol", "")).upper(): str(row.get("name", row.get("symbol", ""))) for _, row in facts.iterrows()}
         news_evidence = fetch_gdelt_news(symbols, names, config.research_limit)
         connector_timings["news"] = round((perf_counter() - started_at) * 1000, 1)
-        evidence = macro_evidence + sec_evidence + news_evidence
+        alpha_news_evidence: list[dict[str, Any]] = []
+        alpha_diagnostic: str | None = None
+        alpha_available = bool(alpha_vantage_api_key())
+        if alpha_available:
+            started_at = perf_counter()
+            alpha_news_evidence, alpha_diagnostic = fetch_alpha_vantage_news(symbols, as_of_date)
+            connector_timings["alpha_vantage_news"] = round((perf_counter() - started_at) * 1000, 1)
+        evidence = macro_evidence + sec_evidence + news_evidence + alpha_news_evidence
         source_status.update({
             "fundamentals": "available" if fundamentals else "unavailable",
             "events": "available" if sec_evidence else "unavailable",
             "macro": "available" if macro.get("series") else "unavailable",
             "news": "available" if any(item.get("status") == "available" for item in news_evidence) else "unavailable",
+            "alpha_vantage_news": "available" if alpha_news_evidence else ("unavailable" if alpha_available else "not_configured"),
         })
         macro_failures = [str(item.get("reason", "")) for item in macro.get("series", {}).values() if isinstance(item, dict) and item.get("reason")]
         sec_failures = [str(item.get("reason", "")) for item in fundamentals.values() if isinstance(item, dict) and item.get("reason")]
@@ -217,7 +225,9 @@ def research_packet(
             source_diagnostics["fundamentals"] = sec_failures[0][:160]
             source_diagnostics["events"] = sec_failures[0][:160]
         if any(item.get("status") == "unavailable" for item in news_evidence):
-            source_diagnostics["news"] = "One or more RSS feeds were unavailable; retry on the next refresh."
+            source_diagnostics["news"] = "One or more GDELT requests were unavailable; retry on the next refresh."
+        if alpha_diagnostic:
+            source_diagnostics["alpha_vantage_news"] = alpha_diagnostic
     scores: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
     for _, row in facts.iterrows():
@@ -246,7 +256,8 @@ def research_packet(
     quality = {}
     for key, status in source_status.items():
         available = status == "available"
-        quality[key] = {"freshness": "current" if available else "unknown", "completeness": 1.0 if available else 0.0, "provenance": "primary" if key in {"fundamentals", "events", "macro"} else "curated", "conflict": "none", "score": 100 if available else 0}
+        provenance = "primary" if key in {"fundamentals", "events", "macro"} else ("secondary" if key == "alpha_vantage_news" else "curated")
+        quality[key] = {"freshness": "current" if available else "unknown", "completeness": 1.0 if available else 0.0, "provenance": provenance, "conflict": "none", "score": 100 if available else 0}
     return {
         "packet_version": PROMPT_VERSION,
         "as_of_date": as_of_date.isoformat(), "benchmark": benchmark,
@@ -255,7 +266,8 @@ def research_packet(
             {"name": "local DuckDB/yfinance price cache", "fetched_at": datetime.now(timezone.utc).isoformat(), "status": "available"},
             {"name": "SEC EDGAR", "status": source_status["fundamentals"]},
             {"name": "FRED", "status": source_status["macro"]},
-            {"name": "curated Google News RSS", "status": source_status["news"]},
+            {"name": "GDELT secondary news discovery", "status": source_status["news"]},
+            {"name": "Alpha Vantage ticker-linked news", "status": source_status["alpha_vantage_news"]},
         ],
         "coverage": source_status, "source_quality": quality, "connector_timings_ms": connector_timings,
         "source_diagnostics": source_diagnostics, "macro": macro, "candidates": enriched,
@@ -340,13 +352,13 @@ def decision_schema_for_packet(packet: dict[str, object]) -> dict[str, Any]:
 def evidence_health(packet: dict[str, object]) -> list[dict[str, str]]:
     """Classify evidence completeness deterministically for the UI and audit trail."""
     coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
-    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "GDELT news discovery"}
+    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "GDELT news discovery", "alpha_vantage_news": "Alpha Vantage news"}
     output = []
     for key, label in labels.items():
         status = str(coverage.get(key, "unresolved"))
         if key == "prices" and status != "available": severity = "critical"
         elif status == "unavailable": severity = "critical" if key in {"fundamentals", "events"} else "high"
-        elif status == "not_requested": severity = "unresolved"
+        elif status in {"not_requested", "not_configured"}: severity = "unresolved"
         elif status == "available": severity = "low"
         else: severity = "medium"
         quality = packet.get("source_quality", {}).get(key, {}) if isinstance(packet, dict) else {}
