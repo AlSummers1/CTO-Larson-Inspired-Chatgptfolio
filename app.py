@@ -1081,7 +1081,10 @@ def main() -> None:
     require_200d = st.sidebar.checkbox("Require 200D pass", value=False)
     require_200w = st.sidebar.checkbox("Require 200W pass", value=False)
     use_relative_strength = st.sidebar.checkbox("Use relative strength in ranking", value=False)
-    refresh_clicked = st.sidebar.button("Refresh cache")
+    sidebar_refresh_clicked = st.sidebar.button("Refresh cache")
+    # The Paper Portfolio control below requests a rerun, so the same explicit
+    # refresh path is used regardless of where the user starts it.
+    refresh_clicked = sidebar_refresh_clicked or bool(st.session_state.pop("paper_portfolio_refresh_requested", False))
 
     if st.session_state.get("dashboard_view") not in VIEW_OPTIONS:
         st.session_state["dashboard_view"] = "Rankings"
@@ -1891,6 +1894,9 @@ def main() -> None:
     elif active_view == "Paper Portfolio":
         st.title("Paper Portfolio")
         st.caption("One approved, paper-only portfolio. Proposals do not affect it until you explicitly approve a rebalance.")
+        if st.button("Refresh market data", icon=":material/refresh:", help="Fetch current prices for the paper holdings and benchmarks, then process any eligible pending paper rebalance."):
+            st.session_state["paper_portfolio_refresh_requested"] = True
+            st.rerun()
         paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
         valuation_started_at = perf_counter()
         completed_rebalances = execute_pending_paper_rebalances(prices, DEFAULT_DB_PATH)
