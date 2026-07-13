@@ -340,6 +340,29 @@ def test_rrg_seed_chart_adds_one_latest_marker_per_seed():
     assert {trace.name for trace in marker_traces} == {"SMH Universe", "Healthcare Universe"}
 
 
+def test_rrg_seed_chart_highlights_selected_seed_and_dims_others():
+    app = importlib.import_module("app")
+    history = pd.DataFrame(
+        [
+            {"seed_name": "SMH Universe", "date": pd.Timestamp("2024-01-05"), "rs_ratio": 99.0, "rs_momentum": 99.0, "quadrant": "Lagging"},
+            {"seed_name": "SMH Universe", "date": pd.Timestamp("2024-01-12"), "rs_ratio": 101.0, "rs_momentum": 101.0, "quadrant": "Leading"},
+            {"seed_name": "Healthcare Universe", "date": pd.Timestamp("2024-01-05"), "rs_ratio": 98.0, "rs_momentum": 102.0, "quadrant": "Improving"},
+            {"seed_name": "Healthcare Universe", "date": pd.Timestamp("2024-01-12"), "rs_ratio": 97.0, "rs_momentum": 101.0, "quadrant": "Improving"},
+        ]
+    )
+    latest = app.latest_seed_rrg(history)
+
+    fig = app.rrg_seed_chart(history, latest, "QQQ", selected_seed="SMH Universe")
+    selected_marker = next(trace for trace in fig.data if trace.name == "SMH Universe")
+    dimmed_marker = next(trace for trace in fig.data if trace.name == "Healthcare Universe")
+    selected_path = next(trace for trace in fig.data if trace.mode == "lines" and trace.line.width == 4)
+    dimmed_path = next(trace for trace in fig.data if trace.mode == "lines" and trace.line.width == 2)
+
+    assert selected_marker.marker.size > dimmed_marker.marker.size
+    assert dimmed_marker.marker.opacity < selected_marker.marker.opacity
+    assert dimmed_path.opacity < selected_path.opacity
+
+
 def test_rrg_chart_highlights_selected_symbol_and_dims_others():
     app = importlib.import_module("app")
     history = pd.DataFrame(

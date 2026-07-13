@@ -648,7 +648,12 @@ def rrg_chart(
     return fig
 
 
-def rrg_seed_chart(rrg_history: pd.DataFrame, latest_table: pd.DataFrame, benchmark: str) -> go.Figure:
+def rrg_seed_chart(
+    rrg_history: pd.DataFrame,
+    latest_table: pd.DataFrame,
+    benchmark: str,
+    selected_seed: str | None = None,
+) -> go.Figure:
     fig = go.Figure()
     if rrg_history.empty:
         fig.update_layout(
@@ -670,6 +675,12 @@ def rrg_seed_chart(rrg_history: pd.DataFrame, latest_table: pd.DataFrame, benchm
         latest = group.iloc[-1]
         quadrant = str(latest["quadrant"])
         color = RRG_COLORS.get(quadrant, "#64748b")
+        is_selected = selected_seed == seed_name
+        is_dimmed = bool(selected_seed) and not is_selected
+        tail_width = 4 if is_selected else 2
+        marker_size = 18 if is_selected else 13
+        trace_opacity = 1.0 if is_selected else (0.14 if is_dimmed else 0.45)
+        marker_opacity = 1.0 if is_selected else (0.28 if is_dimmed else 1.0)
         meta = latest_by_seed.loc[seed_name] if seed_name in latest_by_seed.index else {}
         symbols_used = meta.get("symbols_used", "") if hasattr(meta, "get") else ""
         symbols_missing = meta.get("symbols_missing", "") if hasattr(meta, "get") else ""
@@ -692,8 +703,8 @@ def rrg_seed_chart(rrg_history: pd.DataFrame, latest_table: pd.DataFrame, benchm
                 x=group["rs_ratio"],
                 y=group["rs_momentum"],
                 mode="lines",
-                line={"color": color, "width": 2},
-                opacity=0.45,
+                line={"color": color, "width": tail_width},
+                opacity=trace_opacity,
                 hoverinfo="skip",
                 showlegend=False,
             )
@@ -703,7 +714,7 @@ def rrg_seed_chart(rrg_history: pd.DataFrame, latest_table: pd.DataFrame, benchm
                 x=[latest["rs_ratio"]],
                 y=[latest["rs_momentum"]],
                 mode="markers+text",
-                marker={"color": color, "size": 13, "line": {"color": "white", "width": 1}},
+                marker={"color": color, "size": marker_size, "line": {"color": "white", "width": 3 if is_selected else 1}, "opacity": marker_opacity},
                 text=[seed_name.replace(" Universe", "")],
                 textposition="top center",
                 hovertemplate=hover_text + "<extra></extra>",
@@ -725,9 +736,9 @@ def rrg_seed_chart(rrg_history: pd.DataFrame, latest_table: pd.DataFrame, benchm
                 showarrow=True,
                 arrowhead=2,
                 arrowsize=1,
-                arrowwidth=1.4,
+                arrowwidth=2.4 if is_selected else 1.4,
                 arrowcolor=color,
-                opacity=0.75,
+                opacity=1.0 if is_selected else (0.18 if is_dimmed else 0.75),
             )
 
     fig.add_vline(x=100, line_width=1, line_dash="dash", line_color="#94a3b8")
@@ -1444,7 +1455,27 @@ def main() -> None:
                     st.info("No seed RRG rows available. Try a longer price history or fewer smoothing weeks.")
                 else:
                     latest_seed_history = latest_seed_rrg(seed_history)
-                    st.plotly_chart(rrg_seed_chart(seed_history, latest_seed_history, benchmark), use_container_width=True)
+                    selected_rrg_seed = st.session_state.get("selected_rrg_seed")
+                    if selected_rrg_seed not in set(selected_seed_labels):
+                        selected_rrg_seed = None
+                        st.session_state["selected_rrg_seed"] = None
+                    if selected_rrg_seed:
+                        st.caption(f"Focused RRG seed universe: {selected_rrg_seed}. Click it again to clear the focus.")
+                    else:
+                        st.caption("Click a seed-universe dot to highlight its current point and recent path.")
+                    seed_fig = rrg_seed_chart(seed_history, latest_seed_history, benchmark, selected_seed=selected_rrg_seed)
+                    seed_event = st.plotly_chart(
+                        seed_fig,
+                        use_container_width=True,
+                        key="rrg_seed_chart",
+                        on_select="rerun",
+                        selection_mode="points",
+                    )
+                    clicked_seed = rrg_selection_from_event(seed_event, seed_fig)
+                    new_selected_seed = toggle_rrg_selection(selected_rrg_seed, clicked_seed)
+                    if new_selected_seed != selected_rrg_seed:
+                        st.session_state["selected_rrg_seed"] = new_selected_seed
+                        st.rerun()
                     st.dataframe(
                         latest_seed_history[
                             [
