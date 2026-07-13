@@ -265,12 +265,47 @@ def research_packet(
     }
 
 
+def allowed_packet_references(packet: dict[str, object]) -> list[str]:
+    """Return the finite set of citation labels supported by a frozen packet.
+
+    Literal evidence IDs are the preferred citations.  The small set of
+    ``packet:`` references covers deterministic technical/correlation fields
+    which are intentionally part of the same immutable packet, but do not have
+    separate source records.
+    """
+    references = {
+        str(item.get("evidence_id"))
+        for item in packet.get("evidence", [])
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    references.update({
+        "packet:macro",
+        "packet:candidates",
+        "packet:candidates.entry",
+        "packet:candidates.fundamental_factors",
+        "packet:correlations",
+        "packet:correlations.high_correlation_pairs",
+        "packet:correlations.daily_matrix",
+    })
+    for candidate in packet.get("candidates", []):
+        if not isinstance(candidate, dict) or not candidate.get("symbol"):
+            continue
+        symbol = str(candidate["symbol"]).upper()
+        references.add(f"packet:candidates:{symbol}")
+        references.add(f"packet:correlations.daily_matrix.{symbol}")
+    return sorted(references)
+
+
 def prompt_for_packet(packet: dict[str, object], config: LabConfig) -> str:
+    allowed_references = allowed_packet_references(packet)
     return f"""You are Chatgptfolio's research underwriter. Use ONLY the timestamped research packet below. Do not invent news, fundamentals, prices, citations, targets, or events. This is paper-trading research, not investment advice. Prefer abstaining when evidence is insufficient.
 
-Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Treat the packet's correlation data as a diversification preference: avoid redundant high-correlation combinations when conviction is comparable. Explain downside triggers and bull/base/bear valuation scenarios. Classify every investment risk as critical, high, medium, low, or unresolved and cite packet evidence for it. Do NOT return entry prices, targets, stops, or valuation levels: the UI attaches deterministic price guidance from the packet. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
+Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Treat the packet's correlation data as a diversification preference: avoid redundant high-correlation combinations when conviction is comparable. Explain downside triggers and bull/base/bear valuation scenarios. Classify every investment risk as critical, high, medium, low, or unresolved. Every risk-flag evidence reference must exactly match one item in ALLOWED_EVIDENCE_REFERENCES below; return an empty array when no permitted citation supports the risk. Do NOT return entry prices, targets, stops, or valuation levels: the UI attaches deterministic price guidance from the packet. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
 
 Return JSON matching the requested schema.
+
+ALLOWED_EVIDENCE_REFERENCES:
+{json.dumps(allowed_references)}
 
 RESEARCH_PACKET:
 {json.dumps(packet, sort_keys=True, default=str)}"""
@@ -286,6 +321,20 @@ DECISION_SCHEMA: dict[str, Any] = {
         "holdings": {"type": "array", "maxItems": 15, "items": {"type": "object", "additionalProperties": False, "properties": {"symbol": {"type": "string"}, "score": {"type": "number", "minimum": 0, "maximum": 100}, "confidence": {"type": "number", "minimum": 0, "maximum": 100}, "conviction": {"type": "number", "minimum": 0, "maximum": 100}, "thesis": {"type": "string"}, "catalysts": {"type": "array", "items": {"type": "string"}}, "risks": {"type": "array", "items": {"type": "string"}}, "risk_flags": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"category": {"type": "string"}, "severity": {"type": "string", "enum": list(SEVERITY_ORDER)}, "rationale": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["category", "severity", "rationale", "evidence_refs"]}}, "downside_triggers": {"type": "array", "items": {"type": "string"}}, "scenarios": {"type": "object", "additionalProperties": False, "properties": {"bear": {"type": "string"}, "base": {"type": "string"}, "bull": {"type": "string"}}, "required": ["bear", "base", "bull"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["symbol", "score", "confidence", "conviction", "thesis", "catalysts", "risks", "risk_flags", "downside_triggers", "scenarios", "evidence_refs"]}},
     }, "required": ["abstain_reason", "portfolio_thesis", "portfolio_risks", "cash_target", "holdings"],
 }
+
+
+def decision_schema_for_packet(packet: dict[str, object]) -> dict[str, Any]:
+    """Constrain structured risk citations to the current immutable packet."""
+    schema = json.loads(json.dumps(DECISION_SCHEMA))
+    references = allowed_packet_references(packet) or [""]
+    reference_schema = {"type": "string", "enum": references}
+    risk_reference_items = [
+        schema["properties"]["portfolio_risks"]["items"],
+        schema["properties"]["holdings"]["items"]["properties"]["risk_flags"]["items"],
+    ]
+    for risk_item in risk_reference_items:
+        risk_item["properties"]["evidence_refs"]["items"] = reference_schema
+    return schema
 
 
 def evidence_health(packet: dict[str, object]) -> list[dict[str, str]]:
@@ -328,7 +377,7 @@ class OpenAIPortfolioModel:
             model=self.model,
             input=prompt_for_packet(packet, config),
             reasoning={"effort": "high"} if self.model == DEFAULT_MODEL else {"effort": "medium"},
-            text={"format": {"type": "json_schema", "name": "portfolio_decision", "strict": True, "schema": DECISION_SCHEMA}},
+            text={"format": {"type": "json_schema", "name": "portfolio_decision", "strict": True, "schema": decision_schema_for_packet(packet)}},
         )
         raw = response.output_text
         decision = json.loads(raw)
@@ -462,7 +511,7 @@ def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, con
         if turnover > config.max_turnover + 1e-8:
             errors.append("turnover violates limit")
     if packet is not None:
-        evidence_ids = {str(item.get("evidence_id")) for item in packet.get("evidence", []) if isinstance(item, dict)}
+        evidence_ids = set(allowed_packet_references(packet))
         flags = list(decision.get("portfolio_risks", []))
         for item in holdings:
             if isinstance(item, dict):
@@ -486,7 +535,7 @@ def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, con
             value = summary.get(symbol, {}).get("average_correlation_to_held")
             if isinstance(value, (int, float)) and value > 0.70:
                 warnings.append(f"{symbol} has high average correlation to current holdings ({value:.2f})")
-    return ValidationResult(not errors, errors, warnings)
+    return ValidationResult(not errors, list(dict.fromkeys(errors)), list(dict.fromkeys(warnings)))
 
 
 def paper_orders(previous: pd.DataFrame, decision: dict[str, object], config: LabConfig) -> pd.DataFrame:

@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 
 from stockpicker.data import load_lab_runs, save_lab_research_details, save_lab_research_snapshot, save_lab_run
-from stockpicker.lab import LabConfig, correlation_summary, entry_signal, evidence_health, openai_api_key, optimize_decision, paper_orders, prompt_for_packet, research_packet, validate_decision
+from stockpicker.lab import LabConfig, allowed_packet_references, correlation_summary, decision_schema_for_packet, entry_signal, evidence_health, openai_api_key, optimize_decision, paper_orders, prompt_for_packet, research_packet, validate_decision
 from stockpicker.research import fetch_gdelt_news
 
 
@@ -163,3 +163,35 @@ def test_validator_rejects_risk_reference_outside_packet():
     result = validate_decision(decision, candidates, LabConfig(), packet={"evidence": []})
     assert not result.valid
     assert "outside" in " ".join(result.errors)
+
+
+def test_packet_risk_references_allow_frozen_evidence_and_defined_technical_paths():
+    candidates = pd.DataFrame([{"symbol": "AAA", "sector": "One"}])
+    packet = {
+        "evidence": [{"evidence_id": "source-1"}],
+        "candidates": [{"symbol": "AAA"}],
+        "correlations": {},
+    }
+    assert "source-1" in allowed_packet_references(packet)
+    assert "packet:correlations.daily_matrix.AAA" in allowed_packet_references(packet)
+    decision = {
+        "holdings": [{"symbol": "AAA", "weight": 0.5, "risk_flags": [{"severity": "medium", "evidence_refs": ["packet:correlations.daily_matrix.AAA"]}]}],
+        "cash_weight": 0.5,
+        "portfolio_risks": [{"severity": "low", "evidence_refs": ["source-1"]}],
+    }
+    result = validate_decision(decision, candidates, LabConfig(max_position=0.5, max_sector_exposure=0.6), packet=packet)
+    assert result.valid
+    schema = decision_schema_for_packet(packet)
+    refs = schema["properties"]["portfolio_risks"]["items"]["properties"]["evidence_refs"]["items"]["enum"]
+    assert refs == allowed_packet_references(packet)
+
+
+def test_validator_deduplicates_repeated_invalid_risk_references():
+    candidates = pd.DataFrame([{"symbol": "AAA", "sector": "One"}])
+    decision = {
+        "holdings": [{"symbol": "AAA", "weight": 0.5, "risk_flags": [{"severity": "high", "evidence_refs": ["unknown"]}]}],
+        "cash_weight": 0.5,
+        "portfolio_risks": [{"severity": "high", "evidence_refs": ["unknown"]}],
+    }
+    result = validate_decision(decision, candidates, LabConfig(max_position=0.5, max_sector_exposure=0.6), packet={"evidence": []})
+    assert result.errors == ["risk flag references evidence outside the research packet"]

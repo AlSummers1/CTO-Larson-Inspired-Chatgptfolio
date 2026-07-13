@@ -1823,7 +1823,7 @@ def main() -> None:
             matrix = pd.DataFrame(correlations.get("daily_matrix", {}))
             if not matrix.empty:
                 matrix = matrix.reindex(index=matrix.columns, columns=matrix.columns)
-                st.plotly_chart(go.Figure(data=go.Heatmap(z=matrix.values, x=matrix.columns, y=matrix.index, zmin=-1, zmax=1, colorscale="RdBu", reversescale=True, colorbar={"title": "50D corr"})).update_layout(height=440, margin={"l": 10, "r": 10, "t": 20, "b": 10}), width="stretch", config={"displayModeBar": False})
+                st.plotly_chart(go.Figure(data=go.Heatmap(z=matrix.values, x=matrix.columns, y=matrix.index, zmin=-1, zmax=1, colorscale="RdBu", reversescale=True, colorbar={"title": "50D corr"})).update_layout(height=440, margin={"l": 10, "r": 10, "t": 20, "b": 10}), use_container_width=True, config={"displayModeBar": False})
 
             risk_items = []
             for flag in decision.get("portfolio_risks", []):
@@ -1928,7 +1928,7 @@ def main() -> None:
                 if not markers.empty:
                     fig.add_trace(go.Scatter(x=markers["date"], y=markers["nav"], mode="markers", name="Approved update", marker={"size": 10, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
             fig.update_layout(height=430, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Portfolio value")
-            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             summary_one, summary_two, summary_three, summary_four = st.columns(4)
             summary_one.metric("Turnover", pct(turnover))
             summary_two.metric("Average holding period", f"{max(0, len(nav) // max(1, len(executed)))} market days")
