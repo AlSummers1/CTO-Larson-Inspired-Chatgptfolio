@@ -1,0 +1,7 @@
+pandas
+yfinance
+duckdb
+streamlit
+plotly
+pytest
+openai

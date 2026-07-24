@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/market_data.duckdb
+data/market_data.duckdb.wal
+.env
+.env.*
