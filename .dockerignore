@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+.env
+.env.*
+!.env.example
+.pytest_cache
+__pycache__
+*.py[cod]
+*.duckdb
+*.duckdb.wal
+.DS_Store
+tests
+pytest.ini

@@ -405,19 +405,14 @@ def relative_strength_metrics(
             "relative_strength_label": "Neutral",
         }
 
-    return _relative_strength_from_daily(symbol_daily, benchmark_daily)
-
-
-def _relative_strength_from_daily(symbol_daily: pd.DataFrame, benchmark_daily: pd.DataFrame) -> dict[str, object]:
-    """Compute relative strength from already prepared daily frames."""
-    if symbol_daily.empty or benchmark_daily.empty:
-        return {
-            "rs_3m": float("nan"), "rs_6m": float("nan"), "rs_12m": float("nan"),
-            "relative_strength_score": 50.0, "relative_strength_label": "Neutral",
-        }
     aligned = (
-        symbol_daily[["date", "close"]].rename(columns={"close": "symbol_close"})
-        .merge(benchmark_daily[["date", "close"]].rename(columns={"close": "benchmark_close"}), on="date", how="inner")
+        symbol_daily[["date", "close"]]
+        .rename(columns={"close": "symbol_close"})
+        .merge(
+            benchmark_daily[["date", "close"]].rename(columns={"close": "benchmark_close"}),
+            on="date",
+            how="inner",
+        )
         .sort_values("date")
     )
     if aligned.empty:
@@ -554,13 +549,8 @@ def _warning_text(warnings: list[str]) -> str:
     return "; ".join(dict.fromkeys(warnings))
 
 
-def _compute_symbol_signals(
-    symbol: str,
-    daily: pd.DataFrame,
-    benchmark_daily: pd.DataFrame,
-    benchmark: str,
-    config: SignalConfig,
-) -> dict[str, object]:
+def _compute_symbol_signals(symbol: str, prices: pd.DataFrame, benchmark: str, config: SignalConfig) -> dict[str, object]:
+    daily = _daily_for_symbol(prices, symbol)
     warnings: list[str] = []
     if daily.empty:
         return {
@@ -626,11 +616,7 @@ def _compute_symbol_signals(
     )
     larsson_regime = _larsson_state(latest_close, latest_proxy, slope_over(larsson_proxy, config.larsson_slope_days))
     larsson_history = _larsson_regime_history_from_daily(daily, config)
-    rs_metrics = (
-        {"rs_3m": 0.0, "rs_6m": 0.0, "rs_12m": 0.0, "relative_strength_score": 50.0, "relative_strength_label": "Benchmark"}
-        if symbol == benchmark
-        else _relative_strength_from_daily(daily, benchmark_daily)
-    )
+    rs_metrics = relative_strength_metrics(prices, symbol, benchmark)
 
     pass_200d = _bool_or_none(latest_close, latest_sma200d)
     pass_200w = None if len(weekly_close.dropna()) < config.weekly_filter_window else _bool_or_none(_latest(weekly_close), latest_sma200w)
@@ -677,13 +663,9 @@ def compute_signal_table(
     prepared = prices.copy()
     prepared["symbol"] = prepared["symbol"].astype(str).str.upper()
     prepared["date"] = pd.to_datetime(prepared["date"])
-    prepared["close"] = pd.to_numeric(prepared["close"], errors="coerce")
-    prepared = prepared.dropna(subset=["date", "close"]).sort_values(["symbol", "date"])
     benchmark = benchmark.upper()
-    grouped = {str(symbol): frame.reset_index(drop=True) for symbol, frame in prepared.groupby("symbol", sort=True)}
-    symbols = sorted(grouped)
-    benchmark_daily = grouped.get(benchmark, pd.DataFrame(columns=prepared.columns))
-    rows = [_compute_symbol_signals(symbol, grouped[symbol], benchmark_daily, benchmark, config) for symbol in symbols]
+    symbols = sorted(prepared["symbol"].dropna().unique())
+    rows = [_compute_symbol_signals(symbol, prepared, benchmark, config) for symbol in symbols]
     signal_table = pd.DataFrame(rows)
 
     benchmark_row = signal_table[signal_table["symbol"] == benchmark]

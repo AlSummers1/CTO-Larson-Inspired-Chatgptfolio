@@ -1,44 +1,39 @@
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import date
+from collections.abc import MutableMapping
+from datetime import timedelta
 import json
-from time import perf_counter
+from pathlib import Path
+import re
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from stockpicker.data import (
-    approve_paper_rebalance,
-    cached_symbol_count,
     DEFAULT_DB_PATH,
-    execute_pending_paper_rebalances,
     fetch_price_history,
     latest_cache_timestamp,
     load_fetch_log,
     load_latest_portfolio_snapshot,
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
-    load_lab_runs,
-    load_paper_experiments,
-    load_paper_fills,
-    load_paper_portfolio_dashboard,
-    load_source_health,
-    paper_valuation_symbols,
-    rebuild_paper_nav,
-    save_lab_research_snapshot,
-    save_lab_research_details,
-    save_lab_run,
+    read_cached_prices,
     save_portfolio_snapshot,
 )
+from stockpicker.activity import (
+    capture_analysis_snapshot,
+    load_latest_analysis_snapshot,
+    load_signal_events,
+)
+from stockpicker.data_quality import DERIVED_200W_NOTE, compute_data_health
 from stockpicker.portfolio import (
     PortfolioConfig,
     SENSITIVITY_PROFILES,
     allocate_portfolio,
     apply_sensitivity_to_target,
+    build_allocator_prompt,
     build_portfolio_candidates,
-    cash_target_for_regime,
     compare_portfolios,
     canonical_selected_seeds,
     portfolio_snapshot_metadata,
@@ -46,6 +41,28 @@ from stockpicker.portfolio import (
     rrg_seed_summary,
 )
 from stockpicker.scoring import RankingConfig, rank_universe
+from stockpicker.performance import (
+    INITIAL_PAPER_NAV,
+    SavedBriefPortfolioHistory,
+    build_saved_brief_checkpoints,
+    build_saved_brief_portfolio_history,
+    saved_brief_tracking_symbols,
+)
+from stockpicker.reports import (
+    BriefItem,
+    build_paper_holding_allocation,
+    build_paper_rrg_distribution,
+    build_weekly_report,
+    build_report_brief,
+    generate_ai_commentary,
+    load_saved_weekly_brief,
+    load_saved_weekly_briefs,
+    load_weekly_report,
+    load_weekly_reports,
+    parse_commentary_sections,
+    save_ai_commentary,
+    save_weekly_brief,
+)
 from stockpicker.signals import (
     RRGConfig,
     SignalConfig,
@@ -59,25 +76,6 @@ from stockpicker.signals import (
     weekly_history_with_indicators,
 )
 from stockpicker.universe import UNIVERSE_COLUMNS, load_universe, parse_ticker_text
-from stockpicker.lab import (
-    DEFAULT_MODEL,
-    MODEL_OPTIONS,
-    LabConfig,
-    OpenAIPortfolioModel,
-    SEVERITY_COLORS,
-    SEVERITY_ORDER,
-    config_payload as lab_config_payload,
-    credential_status,
-    decision_hash,
-    evidence_health,
-    paper_orders,
-    optimize_decision,
-    packet_context_metadata,
-    preflight_packet,
-    research_packet,
-    severity_counts,
-    validate_decision,
-)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -97,29 +95,7 @@ SEED_UNIVERSES: dict[str, Path | None] = {
     "Crypto Universe": PROJECT_ROOT / "data" / "universe_crypto.csv",
     "Quantum Universe": PROJECT_ROOT / "data" / "universe_quantum.csv",
     "Cybersecurity Universe": PROJECT_ROOT / "data" / "universe_cybersecurity.csv",
-    "Magnificent Seven Universe": PROJECT_ROOT / "data" / "universe_magnificent_seven.csv",
-    "Space Exploration Universe": PROJECT_ROOT / "data" / "universe_space_exploration.csv",
     MANUAL_ONLY_UNIVERSE: None,
-}
-SEED_UNIVERSE_DISPLAY_NAMES = {
-    "SMH Universe": "Semiconductors (SMH)",
-    "Healthcare Universe": "Healthcare",
-    "GLP-1 and Obesity Universe": "GLP-1 & Obesity",
-    "Defence and Space Universe": "Defence & Space",
-    "Data Center Infrastructure Universe": "Data Center Infra",
-    "Power Grid and Electrification Universe": "Power Grid",
-    "Utilities Universe": "Utilities",
-    "Clean Energy Universe": "Clean Energy",
-    "Nuclear Energy Universe": "Nuclear Energy",
-    "Rare Earths and Strategic Materials Universe": "Rare Earths & Materials",
-    "Crypto Universe": "Crypto",
-    "Quantum Universe": "Quantum",
-    "Cybersecurity Universe": "Cybersecurity",
-    "Magnificent Seven Universe": "Mag7",
-    "Space Exploration Universe": "Space Exploration",
-}
-LEGACY_SEED_UNIVERSE_NAMES = {
-    "Magnificent Seven + SpaceX Universe": "Magnificent Seven Universe",
 }
 RRG_COLORS = {
     "Leading": "#16a34a",
@@ -127,6 +103,7 @@ RRG_COLORS = {
     "Lagging": "#dc2626",
     "Improving": "#2563eb",
 }
+MIN_VISIBLE_ALLOCATION_WEIGHT = 0.001
 RRG_METADATA_COLUMNS = [
     "symbol",
     "name",
@@ -145,7 +122,33 @@ DEFAULT_RRG_SEED_UNIVERSES = [
     "Cybersecurity Universe",
 ]
 DEFAULT_PORTFOLIO_SEED_UNIVERSES = DEFAULT_RRG_SEED_UNIVERSES
-VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Chatgptfolio Lab", "Paper Portfolio", "System Health", "Data Audit"]
+VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Activity", "Data Audit"]
+RANKING_DISPLAY_COLUMNS = [
+    "rank",
+    "symbol",
+    "name",
+    "theme",
+    "larsson_regime_history",
+    "benchmark_adjusted_score",
+    "score",
+    "relative_strength_score",
+    "relative_strength_label",
+    "rs_3m",
+    "rs_6m",
+    "rs_12m",
+    "larsson_regime",
+    "daily_trend",
+    "weekly_trend",
+    "monthly_trend",
+    "pass_200d_label",
+    "pass_200w_label",
+    "latest_close",
+    "drawdown_52w",
+    "extension_sma50d",
+    "extension_sma200d",
+    "extension_sma30w",
+    "data_warnings",
+]
 RRG_CONTROL_HELP = {
     "tail_weeks": "How many recent weekly RRG points to draw as each ticker's rotation trail.",
     "ratio_smoothing": "Weeks used to smooth the stock-vs-benchmark relative trend. Higher values make the RS Ratio less jumpy.",
@@ -154,35 +157,6 @@ RRG_CONTROL_HELP = {
 
 
 st.set_page_config(page_title="CTO-Style Stock Ranking", layout="wide")
-
-
-def record_timing(name: str, started_at: float, cache_state: str = "not cached", details: str = "") -> float:
-    """Keep a local, non-secret performance trace for the System Health view."""
-    elapsed_ms = round((perf_counter() - started_at) * 1000, 1)
-    st.session_state.setdefault("performance_diagnostics", {})[name] = {
-        "operation": name,
-        "duration_ms": elapsed_ms,
-        "cache_state": cache_state,
-        "details": details,
-    }
-    return elapsed_ms
-
-
-def record_duration(name: str, duration_ms: float, cache_state: str = "not cached", details: str = "") -> None:
-    st.session_state.setdefault("performance_diagnostics", {})[name] = {
-        "operation": name,
-        "duration_ms": round(float(duration_ms), 1),
-        "cache_state": cache_state,
-        "details": details,
-    }
-
-
-def session_cache_state(name: str, signature: object) -> str:
-    """Describe whether this browser session reused the same cached-call key."""
-    key = f"_performance_key_{name}"
-    reused = st.session_state.get(key) == signature
-    st.session_state[key] = signature
-    return "session cache key reused" if reused else "new cache key"
 
 
 @st.cache_data
@@ -264,32 +238,12 @@ def seed_universe_options() -> list[str]:
     return list(SEED_UNIVERSES)
 
 
-def seed_universe_display_name(seed_label: str) -> str:
-    """Keep the compact sidebar selector readable without changing stored labels."""
-    return SEED_UNIVERSE_DISPLAY_NAMES.get(seed_label, seed_label)
-
-
-def seed_universe_label_after_migration(current_label: object, options: list[str]) -> str:
-    """Migrate a previously selected seed to its current, available label."""
-    candidate = LEGACY_SEED_UNIVERSE_NAMES.get(str(current_label), str(current_label))
-    return candidate if candidate in options else DEFAULT_SEED_UNIVERSE
-
-
-def benchmark_regime_cash_rule_status(regime: str, enabled: bool) -> str:
-    """Describe the exact regime-driven cash reserve applied to the allocator."""
-    reserve = cash_target_for_regime(regime, enabled)
-    if not enabled:
-        return f"Regime cash rule is off — {regime} benchmark reserve: 0%."
-    return f"Regime cash rule is on — {regime} benchmark reserve: {reserve:.0%}."
-
-
 def seed_rrg_universe_options() -> list[str]:
     return [label for label, path in SEED_UNIVERSES.items() if path is not None]
 
 
 def default_rrg_seed_universes() -> list[str]:
-    options = seed_rrg_universe_options()
-    return [label for label in DEFAULT_RRG_SEED_UNIVERSES if label in options]
+    return seed_rrg_universe_options()
 
 
 def default_portfolio_seed_universes() -> list[str]:
@@ -372,6 +326,35 @@ def prices_for_symbols(prices: pd.DataFrame, symbols: set[str]) -> pd.DataFrame:
     return prices[prices["symbol"].isin(symbols)].copy()
 
 
+def refresh_batch_succeeded(fetch_log: pd.DataFrame, symbols: list[str] | tuple[str, ...]) -> bool:
+    """Return true only when the newest explicit fetch batch succeeded in full."""
+    requested = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+    if not requested or fetch_log.empty or not {"symbol", "fetched_at", "status"}.issubset(fetch_log.columns):
+        return False
+    log = fetch_log.copy()
+    log["symbol"] = log["symbol"].astype(str).str.strip().str.upper()
+    log["fetched_at"] = pd.to_datetime(log["fetched_at"], errors="coerce")
+    newest = log["fetched_at"].max()
+    if pd.isna(newest):
+        return False
+    batch = log[log["fetched_at"] == newest]
+    statuses = batch.drop_duplicates("symbol", keep="first").set_index("symbol")["status"].astype(str).str.lower()
+    return requested.issubset(set(statuses.index)) and statuses.loc[sorted(requested)].isin({"ok", "success"}).all()
+
+
+def data_health_overview(data_health: pd.DataFrame) -> dict[str, object]:
+    if data_health.empty:
+        return {"market_date": "Unknown", "fresh_pct": 0.0, "stale_count": 0}
+    total = len(data_health)
+    fresh = int((data_health["freshness_status"] == "Fresh").sum())
+    reference = pd.to_datetime(data_health["reference_market_date"], errors="coerce").max()
+    return {
+        "market_date": "Unknown" if pd.isna(reference) else reference.strftime("%Y-%m-%d"),
+        "fresh_pct": 100.0 * fresh / total if total else 0.0,
+        "stale_count": int((data_health["freshness_status"] == "Stale").sum()),
+    }
+
+
 def seed_membership_frame(seed_frames: dict[str, pd.DataFrame], labels: list[str]) -> pd.DataFrame:
     frames = []
     for label in labels:
@@ -384,29 +367,6 @@ def seed_membership_frame(seed_frames: dict[str, pd.DataFrame], labels: list[str
     if not frames:
         return pd.DataFrame(columns=[*UNIVERSE_COLUMNS, "seed_universe"])
     return pd.concat(frames, ignore_index=True)
-
-
-def all_seed_universe(seed_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Return one row per ticker while retaining every seed membership."""
-    membership = seed_membership_frame(seed_frames, list(seed_frames))
-    if membership.empty:
-        return empty_universe().assign(seed_memberships=pd.Series(dtype=str))
-    membership["symbol"] = membership["symbol"].astype(str).str.upper()
-    rows = []
-    for symbol, group in membership.groupby("symbol", sort=True):
-        first = group.iloc[0].to_dict()
-        first["symbol"] = symbol
-        first["seed_memberships"] = " · ".join(sorted(group["seed_universe"].dropna().unique()))
-        first["theme"] = first["seed_memberships"]
-        rows.append(first)
-    return pd.DataFrame(rows)[[*UNIVERSE_COLUMNS, "seed_memberships"]]
-
-
-def severity_dot_strip(items: list[dict[str, object]], label: str) -> None:
-    counts = severity_counts(items)
-    dots = " ".join(f"<span style='color:{SEVERITY_COLORS[level]};font-size:1.35rem'>●</span>" * counts[level] for level in SEVERITY_ORDER)
-    summary = " · ".join(f"{counts[level]} {level}" for level in SEVERITY_ORDER if counts[level]) or "No findings"
-    st.markdown(f"**{label}:** {dots}<br><small>{summary}</small>", unsafe_allow_html=True)
 
 
 def seed_text_mode(seed_label: str, seed: pd.DataFrame) -> str:
@@ -428,68 +388,6 @@ def money(value: object) -> str:
     return f"${float(number):,.2f}"
 
 
-def normalize_paper_series(series: pd.DataFrame, value_column: str = "nav", start_value: float = 100_000.0) -> pd.DataFrame:
-    """Normalize one experiment or benchmark series to its own nominal start."""
-    if series.empty or value_column not in series:
-        return pd.DataFrame(columns=[*series.columns, "normalized_nav"])
-    normalized = series.dropna(subset=[value_column]).sort_values("date").copy()
-    if normalized.empty or float(normalized.iloc[0][value_column]) == 0:
-        normalized["normalized_nav"] = float("nan")
-        return normalized
-    normalized["normalized_nav"] = start_value * normalized[value_column] / float(normalized.iloc[0][value_column])
-    return normalized
-
-
-SHARED_MARKET_BENCHMARKS = ("SPY", "QQQ", "GLD", "BTC-USD")
-
-
-def paper_chart_trace_visibility(symbol: object) -> bool | str:
-    """Start broad market references hidden while keeping run-specific traces visible."""
-    return "legendonly" if str(symbol).upper() in SHARED_MARKET_BENCHMARKS else True
-
-
-def paper_experiment_display_name(experiment: pd.Series | dict[str, object]) -> str:
-    """Return a descriptive UI label while leaving the immutable run name intact."""
-    getter = experiment.get if hasattr(experiment, "get") else lambda _key, default=None: default
-    base_name = str(getter("name", "Experiment"))
-    sensitivity = str(getter("sensitivity", "Balanced") or "Balanced")
-    basket_description = str(getter("basket_description", "Long selected equities") or "Long selected equities")
-    return f"{base_name} — {sensitivity} — {basket_description}"
-
-
-def paper_comparison_benchmark_anchor(experiments: pd.DataFrame) -> int | None:
-    """Return the earliest filled selected experiment for shared market references."""
-    if experiments.empty or not {"portfolio_id", "fill_date"}.issubset(experiments.columns):
-        return None
-    filled = experiments.copy()
-    filled["fill_date"] = pd.to_datetime(filled["fill_date"], errors="coerce")
-    filled = filled.dropna(subset=["fill_date"]).sort_values(["fill_date", "portfolio_id"])
-    return int(filled.iloc[0]["portfolio_id"]) if not filled.empty else None
-
-
-def shared_market_benchmark_series(benchmarks: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Normalize the one shared market-reference set; TECHNICAL stays run-specific."""
-    if benchmarks.empty or not {"symbol", "date", "nav"}.issubset(benchmarks.columns):
-        return {}
-    output: dict[str, pd.DataFrame] = {}
-    normalized_symbols = benchmarks["symbol"].astype(str).str.upper()
-    for symbol in SHARED_MARKET_BENCHMARKS:
-        normalized = normalize_paper_series(benchmarks.loc[normalized_symbols == symbol])
-        if not normalized.empty:
-            output[symbol] = normalized
-    return output
-
-
-def paper_comparison_start_warning(experiments: pd.DataFrame) -> str | None:
-    """Explain when selected experiments do not share a comparable start date."""
-    if experiments.empty or "fill_date" not in experiments:
-        return None
-    starts = pd.to_datetime(experiments["fill_date"], errors="coerce").dropna().dt.date.unique()
-    if len(starts) > 1:
-        return "Selected experiments have different start dates. Each series is normalized to $100,000 at its own start, so the comparison is not directly like-for-like."
-    return None
-
-
 BASKET_OVERLAY_COLOR = "#facc15"
 
 
@@ -505,12 +403,19 @@ def scaled_basket_overlay(history: pd.DataFrame, basket_history: pd.DataFrame, v
     if base.empty:
         return pd.DataFrame(columns=["date", "value"])
     start_value = float(base[value_column].iloc[0])
-    if pd.isna(start_value) or start_value <= 0:
+    basket_values = pd.to_numeric(base["basket_index"], errors="coerce")
+    basket_start_value = basket_values.iloc[0]
+    if (
+        pd.isna(start_value)
+        or start_value <= 0
+        or pd.isna(basket_start_value)
+        or basket_start_value <= 0
+    ):
         return pd.DataFrame(columns=["date", "value"])
     return pd.DataFrame(
         {
             "date": base["date"],
-            "value": base["basket_index"] * start_value,
+            "value": basket_values / basket_start_value * start_value,
         }
     )
 
@@ -553,7 +458,14 @@ def weekly_chart(history: pd.DataFrame, symbol: str, overlay: pd.DataFrame | Non
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=history["date"], y=history["weekly_close"], mode="lines", name="Weekly close"))
     fig.add_trace(go.Scatter(x=history["date"], y=history["sma30w"], mode="lines", name="SMA 30W"))
-    fig.add_trace(go.Scatter(x=history["date"], y=history["sma200w"], mode="lines", name="SMA 200W"))
+    fig.add_trace(
+        go.Scatter(
+            x=history["date"],
+            y=history["sma200w"],
+            mode="lines",
+            name="SMA 200W (derived weekly series)",
+        )
+    )
     if overlay is not None and not overlay.empty:
         fig.add_trace(
             go.Scatter(
@@ -747,12 +659,7 @@ def rrg_chart(
     return fig
 
 
-def rrg_seed_chart(
-    rrg_history: pd.DataFrame,
-    latest_table: pd.DataFrame,
-    benchmark: str,
-    selected_seed: str | None = None,
-) -> go.Figure:
+def rrg_seed_chart(rrg_history: pd.DataFrame, latest_table: pd.DataFrame, benchmark: str) -> go.Figure:
     fig = go.Figure()
     if rrg_history.empty:
         fig.update_layout(
@@ -774,12 +681,6 @@ def rrg_seed_chart(
         latest = group.iloc[-1]
         quadrant = str(latest["quadrant"])
         color = RRG_COLORS.get(quadrant, "#64748b")
-        is_selected = selected_seed == seed_name
-        is_dimmed = bool(selected_seed) and not is_selected
-        tail_width = 4 if is_selected else 2
-        marker_size = 18 if is_selected else 13
-        trace_opacity = 1.0 if is_selected else (0.14 if is_dimmed else 0.45)
-        marker_opacity = 1.0 if is_selected else (0.28 if is_dimmed else 1.0)
         meta = latest_by_seed.loc[seed_name] if seed_name in latest_by_seed.index else {}
         symbols_used = meta.get("symbols_used", "") if hasattr(meta, "get") else ""
         symbols_missing = meta.get("symbols_missing", "") if hasattr(meta, "get") else ""
@@ -802,8 +703,8 @@ def rrg_seed_chart(
                 x=group["rs_ratio"],
                 y=group["rs_momentum"],
                 mode="lines",
-                line={"color": color, "width": tail_width},
-                opacity=trace_opacity,
+                line={"color": color, "width": 2},
+                opacity=0.45,
                 hoverinfo="skip",
                 showlegend=False,
             )
@@ -813,7 +714,7 @@ def rrg_seed_chart(
                 x=[latest["rs_ratio"]],
                 y=[latest["rs_momentum"]],
                 mode="markers+text",
-                marker={"color": color, "size": marker_size, "line": {"color": "white", "width": 3 if is_selected else 1}, "opacity": marker_opacity},
+                marker={"color": color, "size": 13, "line": {"color": "white", "width": 1}},
                 text=[seed_name.replace(" Universe", "")],
                 textposition="top center",
                 hovertemplate=hover_text + "<extra></extra>",
@@ -835,9 +736,9 @@ def rrg_seed_chart(
                 showarrow=True,
                 arrowhead=2,
                 arrowsize=1,
-                arrowwidth=2.4 if is_selected else 1.4,
+                arrowwidth=1.4,
                 arrowcolor=color,
-                opacity=1.0 if is_selected else (0.18 if is_dimmed else 0.75),
+                opacity=0.75,
             )
 
     fig.add_vline(x=100, line_width=1, line_dash="dash", line_color="#94a3b8")
@@ -1078,6 +979,14 @@ def portfolio_column_config() -> dict[str, object]:
         "score": st.column_config.NumberColumn("Base Score", help="Core technical ranking score.", format="%.1f"),
         "benchmark_adjusted_score": st.column_config.NumberColumn("Benchmark Score", help="Base score blended with relative strength.", format="%.1f"),
         "relative_strength_score": st.column_config.NumberColumn("RS Score", help="0-100 score versus the selected benchmark.", format="%.1f"),
+        "larsson_regime_history": st.column_config.BarChartColumn(
+            "Regime History",
+            width=120,
+            help="Weekly Larsson-proxy history: high bars are Bull, mid bars are Transition, low bars are Bear.",
+            y_min=0,
+            y_max=1,
+            color="#22c55e",
+        ),
         "larsson_regime": st.column_config.TextColumn("Regime", help="Current Larsson-proxy regime."),
         "rrg_quadrant": st.column_config.TextColumn("RRG", help="Seed-level RRG quadrant behind this holding."),
         "drawdown_52w": st.column_config.NumberColumn("52W DD", help="Current drawdown from 52-week high.", format="%.1f%%"),
@@ -1085,6 +994,32 @@ def portfolio_column_config() -> dict[str, object]:
         "reason_codes": st.column_config.TextColumn("Reasons", help="Deterministic reason codes for inclusion, caps, or cash."),
         "data_warnings": st.column_config.TextColumn("Warnings", help="Data-quality or insufficient-history notes."),
     }
+
+
+def portfolio_allocation_display(target: pd.DataFrame, ranked: pd.DataFrame) -> pd.DataFrame:
+    """Add current regime history to a portfolio table without changing stored allocations."""
+    display = target.copy()
+    history_by_symbol: dict[str, object] = {}
+    if not ranked.empty and {"symbol", "larsson_regime_history"}.issubset(ranked.columns):
+        history_by_symbol = (
+            ranked.drop_duplicates("symbol", keep="first")
+            .set_index("symbol")["larsson_regime_history"]
+            .to_dict()
+        )
+    display["larsson_regime_history"] = display.get("symbol", pd.Series(index=display.index, dtype=object)).map(
+        history_by_symbol
+    )
+    display["larsson_regime_history"] = display["larsson_regime_history"].map(
+        lambda value: list(value) if isinstance(value, (list, tuple)) else []
+    )
+
+    columns = [column for column in display.columns if column != "larsson_regime_history"]
+    if "relative_strength_score" in columns:
+        insert_at = columns.index("relative_strength_score") + 1
+        columns.insert(insert_at, "larsson_regime_history")
+    else:
+        columns.append("larsson_regime_history")
+    return display[columns]
 
 
 def portfolio_change_column_config() -> dict[str, object]:
@@ -1098,15 +1033,160 @@ def portfolio_change_column_config() -> dict[str, object]:
     }
 
 
-def allocation_pie_chart(portfolio: pd.DataFrame, name_column: str, title: str) -> go.Figure:
+def visible_allocation_groups(
+    portfolio: pd.DataFrame,
+    name_column: str,
+    min_weight: float = MIN_VISIBLE_ALLOCATION_WEIGHT,
+) -> pd.DataFrame:
+    if portfolio.empty or name_column not in portfolio.columns or "weight" not in portfolio.columns:
+        return pd.DataFrame(columns=[name_column, "weight"])
+    visible = portfolio[[name_column, "weight"]].copy()
+    visible[name_column] = visible[name_column].fillna("Unknown").astype(str)
+    visible["weight"] = pd.to_numeric(visible["weight"], errors="coerce").fillna(0.0)
+    grouped = visible.groupby(name_column, as_index=False)["weight"].sum()
+    return grouped[grouped["weight"] >= float(min_weight)].reset_index(drop=True)
+
+
+def allocation_pie_chart(
+    portfolio: pd.DataFrame,
+    name_column: str,
+    title: str,
+    *,
+    height: int = 360,
+) -> go.Figure:
     fig = go.Figure()
-    if portfolio.empty or name_column not in portfolio.columns:
-        fig.update_layout(title=title, height=360)
+    grouped = visible_allocation_groups(portfolio, name_column)
+    if grouped.empty:
+        fig.update_layout(title=title, height=height)
         return fig
-    grouped = portfolio.groupby(name_column, as_index=False)["weight"].sum()
-    fig.add_trace(go.Pie(labels=grouped[name_column], values=grouped["weight"], hole=0.45))
-    fig.update_layout(title=title, height=360)
+    fig.add_trace(
+        go.Pie(
+            labels=grouped[name_column],
+            values=grouped["weight"],
+            hole=0.45,
+            texttemplate="%{percent:.1%}",
+            textposition="auto",
+            hovertemplate="%{label}<br>Allocation: %{value:.1%}<extra></extra>",
+        )
+    )
+    fig.update_layout(title=title, height=height)
     return fig
+
+
+def paper_rrg_distribution_chart(distribution: pd.DataFrame) -> go.Figure:
+    colors = {**RRG_COLORS, "Cash / Unclassified": "#64748b"}
+    fig = go.Figure()
+    if distribution.empty:
+        fig.update_layout(title="Paper Portfolio RRG Distribution", height=340)
+        return fig
+    fig.add_trace(
+        go.Pie(
+            labels=distribution["quadrant"],
+            values=distribution["weight"],
+            customdata=distribution[["holding_count", "holdings"]],
+            marker={"colors": [colors.get(value, "#64748b") for value in distribution["quadrant"]]},
+            hole=0.45,
+            sort=False,
+            textinfo="label+percent",
+            hovertemplate=(
+                "%{label}<br>Portfolio weight: %{value:.1%}<br>"
+                "Holdings: %{customdata[0]}<br>%{customdata[1]}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title="Paper Portfolio RRG Distribution",
+        height=360,
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        legend={"orientation": "h", "yanchor": "bottom", "y": -0.15, "xanchor": "center", "x": 0.5},
+    )
+    return fig
+
+
+def saved_brief_portfolio_chart(
+    history: SavedBriefPortfolioHistory,
+    selected_saved_brief_id: int,
+) -> go.Figure:
+    fig = go.Figure()
+    if history.nav.empty:
+        fig.update_layout(height=420)
+        return fig
+    fig.add_trace(
+        go.Scatter(
+            x=history.nav["date"],
+            y=history.nav["nav"],
+            name="Saved brief portfolio",
+            mode="lines",
+            line={"color": "#38bdf8", "width": 3},
+            hovertemplate="%{x|%Y-%m-%d}<br>Portfolio: $%{y:,.0f}<extra></extra>",
+        )
+    )
+    benchmark_colors = {"Brief benchmark": "#f59e0b", "Brief benchmark · SPY": "#f59e0b", "SPY": "#94a3b8"}
+    for series, rows in history.benchmarks.groupby("series", sort=False):
+        fig.add_trace(
+            go.Scatter(
+                x=rows["date"],
+                y=rows["nav"],
+                name=str(series),
+                mode="lines",
+                line={"color": benchmark_colors.get(str(series), "#94a3b8"), "width": 1.5, "dash": "dot"},
+                customdata=rows[["symbol"]],
+                hovertemplate="%{x|%Y-%m-%d}<br>%{fullData.name}: $%{y:,.0f}<br>Active: %{customdata[0]}<extra></extra>",
+            )
+        )
+    applied = history.checkpoints[history.checkpoints["status"] == "Applied"].copy()
+    if not applied.empty:
+        markers = applied.merge(
+            history.nav[["date", "nav"]],
+            left_on="effective_date",
+            right_on="date",
+            how="left",
+        )
+        markers["selected"] = markers["saved_brief_id"].astype(int) == int(selected_saved_brief_id)
+        for selected, rows in markers.groupby("selected", sort=True):
+            fig.add_trace(
+                go.Scatter(
+                    x=rows["effective_date"],
+                    y=rows["nav"],
+                    name="Selected checkpoint" if selected else "Saved brief checkpoint",
+                    mode="markers",
+                    marker={
+                        "symbol": "diamond",
+                        "size": 13 if selected else 9,
+                        "color": "#f97316" if selected else "#facc15",
+                        "line": {"color": "#ffffff", "width": 1 if selected else 0},
+                    },
+                    customdata=rows[["title", "evidence_date", "saved_brief_id"]],
+                    hovertemplate=(
+                        "%{customdata[0]}<br>Evidence: %{customdata[1]|%Y-%m-%d}<br>"
+                        "Rebalanced: %{x|%Y-%m-%d}<br>Portfolio: $%{y:,.0f}<extra></extra>"
+                    ),
+                )
+            )
+    fig.update_layout(
+        height=440,
+        margin={"l": 10, "r": 10, "t": 20, "b": 10},
+        yaxis_title="Value ($100,000 start)",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": -0.25, "xanchor": "center", "x": 0.5},
+    )
+    return fig
+
+
+def saved_brief_tracking_metrics(history: SavedBriefPortfolioHistory) -> dict[str, float]:
+    if history.nav.empty:
+        return {}
+    current_nav = float(history.nav.iloc[-1]["nav"])
+    portfolio_return = current_nav / INITIAL_PAPER_NAV - 1.0
+    max_drawdown = float(history.nav["drawdown"].min())
+    dynamic = history.benchmarks[history.benchmarks["series"].astype(str).str.startswith("Brief benchmark")]
+    benchmark_return = float(dynamic.iloc[-1]["nav"]) / INITIAL_PAPER_NAV - 1.0 if not dynamic.empty else float("nan")
+    return {
+        "current_nav": current_nav,
+        "return": portfolio_return,
+        "max_drawdown": max_drawdown,
+        "versus_benchmark": portfolio_return - benchmark_return,
+    }
 
 
 def symbol_from_dataframe_selection(event: object, ranked: pd.DataFrame) -> str | None:
@@ -1124,43 +1204,633 @@ def symbol_from_dataframe_selection(event: object, ranked: pd.DataFrame) -> str 
     return str(ranked.iloc[row_index]["symbol"])
 
 
-def dashboard_view_after_pending_request(current_view: object, requested_view: object) -> str:
-    """Choose a valid dashboard view before its navigation widget is created."""
-    if requested_view in VIEW_OPTIONS:
-        return str(requested_view)
-    if current_view in VIEW_OPTIONS:
-        return str(current_view)
-    return "Rankings"
+def _text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def parse_report_payload(value: object) -> dict[str, object]:
+    try:
+        parsed = json.loads(_text(value) or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def activity_event_category(event_type: object) -> str:
+    event = _text(event_type).lower()
+    if "paper_allocation" in event:
+        return "Portfolio"
+    if "rrg" in event or "quadrant" in event:
+        return "RRG"
+    if "regime" in event:
+        return "Regime"
+    if "freshness" in event or "data" in event or "coverage" in event:
+        return "Data"
+    return "Other"
+
+
+def activity_event_label(event_type: object) -> str:
+    labels = {
+        "benchmark_regime_change": "Benchmark regime changed",
+        "larsson_regime_change": "Regime changed",
+        "stock_rrg_quadrant_change": "RRG quadrant changed",
+        "seed_rrg_quadrant_change": "RRG quadrant changed",
+        "freshness_status_change": "Data freshness changed",
+        "paper_allocation_added": "Added to paper portfolio",
+        "paper_allocation_removed": "Removed from paper portfolio",
+        "paper_allocation_changed": "Paper weight changed",
+    }
+    event = _text(event_type)
+    return labels.get(event, event.replace("_", " ").title())
+
+
+def filter_activity_events(
+    events: pd.DataFrame,
+    *,
+    categories: list[str],
+    subject: str = "All",
+    window_days: int | None = 30,
+    today: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if events.empty:
+        return events.copy()
+    filtered = events.copy()
+    filtered["event_category"] = filtered["event_type"].map(activity_event_category)
+    filtered = filtered[filtered["event_category"].isin(categories)]
+    if subject != "All":
+        filtered = filtered[filtered["subject"].astype(str) == subject]
+    filtered["effective_market_date"] = pd.to_datetime(filtered["effective_market_date"], errors="coerce")
+    if window_days is not None:
+        reference = pd.Timestamp.now().normalize() if today is None else pd.Timestamp(today).normalize()
+        filtered = filtered[filtered["effective_market_date"] >= reference - timedelta(days=window_days)]
+    return filtered.sort_values(["effective_market_date", "event_type", "subject"], ascending=[False, True, True])
+
+
+def report_evidence_table(payload: dict[str, object]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    effective_date = _text(payload.get("effective_market_date"))[:10]
+    for item in payload.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "Evidence ID": _text(item.get("evidence_id")),
+                "Date": _text(item.get("effective_market_date") or effective_date)[:10],
+                "Type": _text(item.get("event_type") or item.get("kind")),
+                "Subject": _text(item.get("subject") or item.get("symbol")),
+                "Value": _text(item.get("new_value") or item.get("larsson_regime") or item.get("weight")),
+            }
+        )
+    return pd.DataFrame(rows, columns=["Evidence ID", "Date", "Type", "Subject", "Value"])
+
+
+def queue_weekly_report_selection(state: MutableMapping[str, object], report_id: int) -> None:
+    """Defer a report-widget selection until the next Streamlit run."""
+    state["pending_weekly_report_id"] = int(report_id)
+
+
+def apply_pending_weekly_report_selection(state: MutableMapping[str, object]) -> None:
+    """Apply a deferred report selection before its widget is instantiated."""
+    pending_report_id = state.pop("pending_weekly_report_id", None)
+    if pending_report_id is not None:
+        state["selected_weekly_report_id"] = int(pending_report_id)
+
+
+def queue_saved_weekly_brief_selection(state: MutableMapping[str, object], saved_brief_id: int) -> None:
+    """Switch to a newly saved brief on the next Streamlit run."""
+    state["pending_saved_weekly_brief_id"] = int(saved_brief_id)
+    state["pending_weekly_brief_library"] = "Saved"
+
+
+def apply_pending_saved_weekly_brief_selection(state: MutableMapping[str, object]) -> None:
+    pending_library = state.pop("pending_weekly_brief_library", None)
+    if pending_library in {"Generated", "Saved"}:
+        state["weekly_brief_library"] = pending_library
+    pending_brief_id = state.pop("pending_saved_weekly_brief_id", None)
+    if pending_brief_id is not None:
+        state["selected_saved_weekly_brief_id"] = int(pending_brief_id)
+
+
+def default_saved_brief_title(selected_report: dict[str, object], payload: dict[str, object]) -> str:
+    benchmark = _text(selected_report.get("benchmark") or payload.get("benchmark")) or "Market"
+    effective_date = _text(payload.get("effective_market_date"))[:10] or "undated"
+    return f"{benchmark} Weekly Brief — {effective_date}"
+
+
+def _render_brief_items(items: tuple[BriefItem, ...], empty_message: str, overflow: int = 0) -> None:
+    if not items:
+        st.caption(empty_message)
+        return
+    for item in items:
+        st.markdown(f"**{item.subject}** · {item.label}")
+        st.caption(item.detail)
+    if overflow:
+        st.caption(f"{overflow} more in the full report")
+
+
+COMMENTARY_SECTION_STYLES = {
+    "summary": ("🧭", "Key takeaways"),
+    "opportunities": ("🚀", "Opportunities"),
+    "risks": ("⚠️", "Risks"),
+    "watch_items": ("👀", "Watch items"),
+}
+
+
+def split_commentary_points(value: object) -> list[str]:
+    """Split model prose at explicit observation and interpretation markers."""
+    text = _text(value).strip()
+    if not text:
+        return []
+    points = re.split(r"(?=\b(?:Observation|Interpretation):\s*)", text, flags=re.IGNORECASE)
+    return [point.strip() for point in points if point.strip()]
+
+
+def commentary_point_markdown(point: str, section: str) -> str:
+    labeled = re.match(r"^(Observation|Interpretation):\s*(.*)$", point.strip(), flags=re.IGNORECASE | re.DOTALL)
+    if labeled:
+        label = labeled.group(1).capitalize()
+        icon = "🔎" if label == "Observation" else "💡"
+        return f"- {icon} **{label}:** {labeled.group(2).strip()}"
+    icon = COMMENTARY_SECTION_STYLES.get(section, ("•", ""))[0]
+    return f"- {icon} {point.strip()}"
+
+
+def _render_chatgptfolio_commentary(
+    selected_report: dict[str, object],
+    report_id: int,
+    *,
+    allow_generation: bool = True,
+) -> None:
+    with st.container(border=True):
+        st.markdown("#### Chatgptfolio view")
+        sections = parse_commentary_sections(selected_report.get("commentary_json"))
+        legacy_commentary = _text(selected_report.get("commentary"))
+        status = _text(selected_report.get("generation_status")) or "not_requested"
+        if sections:
+            summary_items = sections.get("summary", [])
+            if summary_items:
+                summary_points = [
+                    point
+                    for item in summary_items
+                    for point in split_commentary_points(item.get("text"))
+                ]
+                summary_icon, summary_label = COMMENTARY_SECTION_STYLES["summary"]
+                summary_markdown = "\n".join(
+                    commentary_point_markdown(point, "summary") for point in summary_points
+                )
+                st.markdown(f"**{summary_icon} {summary_label}**\n\n{summary_markdown}")
+            else:
+                st.caption("No evidence-backed summary was identified.")
+            supporting_count = sum(
+                len(split_commentary_points(item.get("text")))
+                for section in ["opportunities", "risks", "watch_items"]
+                for item in sections.get(section, [])
+            )
+            if supporting_count:
+                with st.expander(f"Supporting observations ({supporting_count})"):
+                    for section in ["opportunities", "risks", "watch_items"]:
+                        items = sections.get(section, [])
+                        if not items:
+                            continue
+                        icon, label = COMMENTARY_SECTION_STYLES[section]
+                        section_points: list[str] = []
+                        for item in items:
+                            refs = ", ".join(item.get("evidence_ids", []))
+                            for point in split_commentary_points(item.get("text")):
+                                reference = f" · `{refs}`" if refs else ""
+                                section_points.append(f"{commentary_point_markdown(point, section)}{reference}")
+                        st.markdown(f"**{icon} {label}**\n\n" + "\n".join(section_points))
+        elif legacy_commentary:
+            st.caption("This older report has commentary in the legacy format.")
+            with st.expander("Open full commentary"):
+                st.markdown(legacy_commentary)
+        else:
+            st.caption(
+                "Generate a short, evidence-linked interpretation for this report. It cannot change rankings or allocations."
+                if allow_generation
+                else "No Chatgptfolio commentary was captured in this saved brief."
+            )
+
+        if sections or legacy_commentary:
+            metadata: list[str] = []
+            if _text(selected_report.get("ai_model")):
+                metadata.append(_text(selected_report.get("ai_model")))
+            if _text(selected_report.get("commentary_created_at")):
+                created = pd.Timestamp(selected_report["commentary_created_at"])
+                metadata.append(created.strftime("%Y-%m-%d %H:%M"))
+            if metadata:
+                st.caption(" · ".join(metadata))
+        if status not in {"success", "not_requested"} and _text(selected_report.get("diagnostic")):
+            st.warning(_text(selected_report.get("diagnostic")))
+
+        if allow_generation and st.button(
+            "Generate commentary" if not legacy_commentary else "Regenerate commentary",
+            key=f"generate_commentary_{report_id}",
+            type="secondary",
+        ):
+            evidence_payload = parse_report_payload(selected_report.get("evidence_json"))
+            with st.spinner("Building evidence-linked commentary…"):
+                result = generate_ai_commentary(evidence_payload)
+            save_ai_commentary(report_id, result, DEFAULT_DB_PATH)
+            if result.status == "success":
+                st.session_state["activity_notice"] = f"Commentary generated with {result.model}."
+                st.session_state["activity_notice_kind"] = "success"
+            else:
+                st.session_state["activity_notice"] = result.diagnostic
+                st.session_state["activity_notice_kind"] = "warning"
+            st.rerun()
+
+
+def _saved_briefs_for_tracking(saved_history: pd.DataFrame) -> list[dict[str, object]]:
+    briefs: list[dict[str, object]] = []
+    for row in saved_history.sort_values(["created_at", "saved_brief_id"]).itertuples(index=False):
+        try:
+            briefs.append(load_saved_weekly_brief(int(row.saved_brief_id), DEFAULT_DB_PATH))
+        except ValueError as exc:
+            briefs.append(
+                {
+                    "saved_brief_id": int(row.saved_brief_id),
+                    "saved_title": str(row.title),
+                    "saved_at": row.created_at,
+                    "evidence_json": "",
+                    "tracking_error": str(exc),
+                }
+            )
+    return briefs
+
+
+def _render_saved_brief_portfolio_tracker(
+    saved_history: pd.DataFrame,
+    selected_saved_brief_id: int,
+) -> None:
+    tracking_briefs = _saved_briefs_for_tracking(saved_history)
+    checkpoints = build_saved_brief_checkpoints(tracking_briefs)
+    required_symbols = saved_brief_tracking_symbols(checkpoints)
+
+    with st.container(border=True):
+        title_col, refresh_col = st.columns([4, 1])
+        title_col.markdown("#### Saved Brief Portfolio History")
+        title_col.caption("One evolving hypothetical portfolio, rebalanced from immutable saved-brief allocations.")
+        refresh_clicked = refresh_col.button(
+            "Refresh tracker prices",
+            key="refresh_saved_brief_tracker_prices",
+            width="stretch",
+            disabled=not required_symbols,
+            help="Refresh only saved holdings, their report benchmarks, and SPY.",
+        )
+        if refresh_clicked:
+            with st.spinner(f"Refreshing {len(required_symbols)} tracker symbols…"):
+                fetch_price_history(list(required_symbols), refresh=True, years=10, db_path=DEFAULT_DB_PATH)
+            st.session_state["activity_notice"] = "Saved-brief tracker prices refreshed."
+            st.session_state["activity_notice_kind"] = "success"
+            st.rerun()
+
+        prices = read_cached_prices(list(required_symbols), DEFAULT_DB_PATH) if required_symbols else pd.DataFrame()
+        history = build_saved_brief_portfolio_history(checkpoints, prices)
+        if history.missing_symbols:
+            st.warning("Missing cached tracker history: " + ", ".join(history.missing_symbols))
+
+        if history.nav.empty:
+            ready_or_pending = history.checkpoints[
+                history.checkpoints["status"].isin(["Ready", "Pending"])
+            ] if not history.checkpoints.empty else pd.DataFrame()
+            if ready_or_pending.empty:
+                st.info("No usable paper allocation was captured in the saved brief library.")
+            else:
+                st.info(
+                    "Awaiting the first eligible cached market open after the saved evidence date. "
+                    "Refresh tracker prices after a new market session to begin the history."
+                )
+        else:
+            metrics = saved_brief_tracking_metrics(history)
+            metric_one, metric_two, metric_three, metric_four = st.columns(4)
+            metric_one.metric("Current value", money(metrics["current_nav"]), pct(metrics["return"]))
+            metric_two.metric("Total return", pct(metrics["return"]))
+            metric_three.metric("Max drawdown", pct(metrics["max_drawdown"]))
+            metric_four.metric("Vs brief benchmark", pct(metrics["versus_benchmark"]))
+            st.plotly_chart(
+                saved_brief_portfolio_chart(history, selected_saved_brief_id),
+                use_container_width=True,
+                key="saved_brief_portfolio_history",
+                config={"displayModeBar": False},
+            )
+            latest_date = pd.Timestamp(history.latest_valuation_date).strftime("%Y-%m-%d")
+            st.caption(
+                f"Valued through {latest_date} from adjusted local prices. Rebalances use the next eligible cached open; "
+                "fractional shares, zero costs, no cash yield, and no broker execution."
+            )
+
+        with st.expander(f"Checkpoint audit ({len(history.checkpoints)})"):
+            if history.checkpoints.empty:
+                st.caption("No saved brief checkpoints are available.")
+            else:
+                audit = history.checkpoints[
+                    [
+                        "saved_brief_id",
+                        "title",
+                        "evidence_date",
+                        "effective_date",
+                        "status",
+                        "benchmark",
+                        "holding_count",
+                        "cash_weight",
+                        "diagnostic",
+                    ]
+                ].copy()
+                audit["cash_weight"] = audit["cash_weight"] * 100
+                st.dataframe(
+                    audit,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "saved_brief_id": st.column_config.NumberColumn("Brief", format="#%d"),
+                        "title": st.column_config.TextColumn("Title"),
+                        "evidence_date": st.column_config.DateColumn("Evidence Date", format="YYYY-MM-DD"),
+                        "effective_date": st.column_config.DateColumn("Simulated Rebalance", format="YYYY-MM-DD"),
+                        "status": st.column_config.TextColumn("Status"),
+                        "benchmark": st.column_config.TextColumn("Benchmark"),
+                        "holding_count": st.column_config.NumberColumn("Holdings", format="%d"),
+                        "cash_weight": st.column_config.NumberColumn("Cash", format="%.1f%%"),
+                        "diagnostic": st.column_config.TextColumn("Diagnostic"),
+                    },
+                )
+
+
+def _render_weekly_brief() -> None:
+    apply_pending_weekly_report_selection(st.session_state)
+    apply_pending_saved_weekly_brief_selection(st.session_state)
+    st.markdown("### Weekly Brief")
+    st.caption("A decision-ready summary of the latest local evidence. Full Markdown and evidence remain available below.")
+
+    library_mode = st.segmented_control(
+        "Brief library",
+        ["Generated", "Saved"],
+        default="Generated",
+        key="weekly_brief_library",
+        label_visibility="collapsed",
+    ) or "Generated"
+
+    notice = st.session_state.pop("activity_notice", "")
+    notice_kind = st.session_state.pop("activity_notice_kind", "info")
+    if notice:
+        getattr(st, notice_kind if notice_kind in {"success", "warning", "info"} else "info")(notice)
+
+    selected_report: dict[str, object] = {}
+    saved_history = pd.DataFrame()
+    content_key = ""
+    allow_commentary_generation = library_mode == "Generated"
+    if library_mode == "Saved":
+        saved_history = load_saved_weekly_briefs(DEFAULT_DB_PATH)
+        if saved_history.empty:
+            st.info("No named briefs have been saved yet. Select Generated, then use Save brief to create one.")
+            return
+        saved_labels = {
+            int(row.saved_brief_id): (
+                f"{row.title} · {pd.Timestamp(row.created_at).strftime('%b %d, %Y %H:%M')} · #{int(row.saved_brief_id)}"
+            )
+            for row in saved_history.itertuples(index=False)
+        }
+        saved_ids = list(saved_labels)
+        if st.session_state.get("selected_saved_weekly_brief_id") not in saved_ids:
+            st.session_state["selected_saved_weekly_brief_id"] = saved_ids[0]
+        saved_brief_id = int(
+            st.selectbox(
+                "Saved briefs",
+                saved_ids,
+                format_func=lambda brief_id: saved_labels[brief_id],
+                key="selected_saved_weekly_brief_id",
+                label_visibility="collapsed",
+            )
+        )
+        try:
+            selected_report = load_saved_weekly_brief(saved_brief_id, DEFAULT_DB_PATH)
+        except ValueError as exc:
+            st.warning(str(exc))
+            return
+        if not selected_report:
+            st.warning("The selected saved brief no longer exists.")
+            return
+        content_key = f"saved_{saved_brief_id}"
+    else:
+        report_history = load_weekly_reports(DEFAULT_DB_PATH)
+        selector_col, generate_col, save_col = st.columns([4, 1, 1])
+        if report_history.empty:
+            selector_col.caption("No report history yet")
+        else:
+            report_labels = {
+                int(row.report_id): (
+                    f"{pd.Timestamp(row.created_at).strftime('%b %d, %Y')} · "
+                    f"{row.benchmark} · v{int(row.report_version)}"
+                )
+                for row in report_history.itertuples(index=False)
+            }
+            report_ids = list(report_labels)
+            if st.session_state.get("selected_weekly_report_id") not in report_ids:
+                st.session_state["selected_weekly_report_id"] = report_ids[0]
+            selector_col.selectbox(
+                "Report history",
+                report_ids,
+                format_func=lambda report_id: report_labels[report_id],
+                key="selected_weekly_report_id",
+                label_visibility="collapsed",
+            )
+        if generate_col.button("Generate latest", type="primary", width="stretch"):
+            try:
+                generated_report = build_weekly_report(DEFAULT_DB_PATH)
+                queue_weekly_report_selection(st.session_state, generated_report.report_id)
+                st.session_state["activity_notice"] = (
+                    f"Created report v{generated_report.version}."
+                    if generated_report.created_new
+                    else "Evidence is unchanged; the existing report is selected."
+                )
+                st.session_state["activity_notice_kind"] = "success" if generated_report.created_new else "info"
+                st.rerun()
+            except RuntimeError as exc:
+                st.warning(str(exc))
+        if report_history.empty:
+            save_col.caption("Save brief")
+            st.info("Generate the first weekly brief after a successful data refresh.")
+            return
+
+        report_id = int(st.session_state["selected_weekly_report_id"])
+        selected_report = load_weekly_report(report_id, DEFAULT_DB_PATH)
+        payload_for_title = parse_report_payload(selected_report.get("evidence_json"))
+        with save_col.popover("Save brief", width="stretch"):
+            st.caption("Create an immutable copy of this report and its current commentary.")
+            with st.form(f"save_weekly_brief_{report_id}"):
+                saved_title = st.text_input(
+                    "Brief title",
+                    value=default_saved_brief_title(selected_report, payload_for_title),
+                    max_chars=120,
+                )
+                if st.form_submit_button("Save snapshot", type="primary", width="stretch"):
+                    try:
+                        saved = save_weekly_brief(saved_title, report_id, DEFAULT_DB_PATH)
+                    except ValueError as exc:
+                        st.warning(str(exc))
+                    else:
+                        queue_saved_weekly_brief_selection(st.session_state, saved.saved_brief_id)
+                        st.session_state["activity_notice"] = f"Saved “{saved.title}”."
+                        st.session_state["activity_notice_kind"] = "success"
+                        st.rerun()
+        content_key = f"report_{report_id}"
+
+    payload = parse_report_payload(selected_report.get("evidence_json"))
+    brief = build_report_brief(payload)
+    if library_mode == "Saved":
+        saved_at = pd.Timestamp(selected_report.get("saved_at")).strftime("%Y-%m-%d %H:%M")
+        st.caption(
+            f"Saved {saved_at} · immutable snapshot · evidence date {brief.effective_market_date} · "
+            f"{brief.evidence_count} evidence records"
+        )
+    else:
+        st.caption(
+            f"Evidence date {brief.effective_market_date} · {brief.evidence_count} evidence records · "
+            "local data only"
+        )
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Market stance", brief.benchmark_regime, help=f"Current Larsson-proxy regime for {brief.benchmark}.")
+    kpi2.metric("Data confidence", f"{brief.fresh_count}/{brief.stock_count} fresh", f"{brief.freshness_pct:.0f}%", delta_color="off")
+    kpi3.metric("Material changes", brief.material_change_count, help="All captured signal changes in this report window.")
+    kpi4.metric("Portfolio changes", brief.allocation_change_count, help="Changes to the saved paper allocation only.")
+
+    source_report_id = int(selected_report.get("source_report_id") or selected_report.get("report_id") or 0)
+    _render_chatgptfolio_commentary(
+        selected_report,
+        source_report_id,
+        allow_generation=allow_commentary_generation,
+    )
+
+    holding_allocation = build_paper_holding_allocation(payload)
+    with st.container(border=True):
+        if holding_allocation.empty:
+            st.markdown("#### Allocation by Holding")
+            st.caption("No saved paper-allocation evidence was captured in this brief.")
+        else:
+            st.plotly_chart(
+                allocation_pie_chart(
+                    holding_allocation,
+                    "symbol",
+                    "Allocation by Holding",
+                    height=560,
+                ),
+                use_container_width=True,
+                key=f"paper_holding_allocation_{content_key}",
+            )
+            st.caption("Holding weights captured with this brief; historical snapshots never use the live portfolio.")
+
+    rrg_distribution = build_paper_rrg_distribution(payload)
+    with st.container(border=True):
+        if rrg_distribution.empty:
+            st.markdown("#### Paper Portfolio RRG Distribution")
+            st.caption("No saved paper-allocation evidence was captured in this brief.")
+        else:
+            st.plotly_chart(
+                paper_rrg_distribution_chart(rrg_distribution),
+                use_container_width=True,
+                key=f"paper_rrg_distribution_{content_key}",
+            )
+            st.caption("Portfolio weights grouped by the RRG quadrant captured with this brief.")
+
+    if library_mode == "Saved":
+        _render_saved_brief_portfolio_tracker(saved_history, int(selected_report["saved_brief_id"]))
+
+    leaders_col, risks_col = st.columns(2)
+    with leaders_col.container(border=True):
+        st.markdown("#### Leaders")
+        st.caption("Fresh Bull candidates above the 200-day trend, ranked by score.")
+        _render_brief_items(brief.leaders, "No candidate meets the leader criteria in this report.", brief.leader_overflow)
+    with risks_col.container(border=True):
+        st.markdown("#### Risks to review")
+        st.caption("Data issues and deteriorating technical states, ordered by urgency.")
+        _render_brief_items(brief.risks, "No deterministic risk flag is active.", brief.risk_overflow)
+
+    changes_col, impact_col = st.columns(2)
+    with changes_col.container(border=True):
+        st.markdown("#### What changed")
+        _render_brief_items(brief.changes, "No material signal change was captured.", brief.change_overflow)
+    with impact_col.container(border=True):
+        st.markdown("#### Paper portfolio impact")
+        if brief.allocation_changes:
+            _render_brief_items(brief.allocation_changes, "", brief.allocation_overflow)
+        elif brief.has_paper_allocation:
+            st.caption("A saved paper portfolio exists; no allocation change was recorded in this report window.")
+        else:
+            st.caption("No saved paper allocation is available for this report.")
+
+    with st.expander("Full deterministic report"):
+        st.markdown(_text(selected_report.get("markdown")))
+        st.download_button(
+            "Download Markdown",
+            data=_text(selected_report.get("markdown")),
+            file_name=f"weekly-ta-report-v{int(selected_report.get('report_version', 1))}.md",
+            mime="text/markdown",
+            key=f"download_report_{content_key}",
+        )
+    with st.expander(f"Evidence ledger ({brief.evidence_count})"):
+        st.dataframe(report_evidence_table(payload), width="stretch", hide_index=True)
+    st.caption("Informational only. No brokerage connection, order generation, or execution occurs.")
+
+
+def _render_change_log() -> None:
+    st.markdown("### Change Log")
+    st.caption("A chronological audit trail of regime, RRG, data-quality, and paper-portfolio changes.")
+    all_events = load_signal_events(DEFAULT_DB_PATH, limit=2_000)
+    if all_events.empty:
+        st.info("No changes logged yet. The first successful refresh establishes a baseline; later comparable refreshes create events.")
+        return
+
+    categories = ["Regime", "RRG", "Portfolio", "Data", "Other"]
+    subjects = sorted(all_events["subject"].dropna().astype(str).unique())
+    with st.popover("Filters"):
+        selected_categories = st.multiselect("Change type", categories, default=categories, key="change_log_categories")
+        selected_subject = st.selectbox("Symbol / subject", ["All", *subjects], key="change_log_subject")
+        time_window = st.selectbox("Time window", ["30 days", "7 days", "90 days", "All"], key="change_log_window")
+    window_days = {"7 days": 7, "30 days": 30, "90 days": 90}.get(time_window)
+    filtered = filter_activity_events(
+        all_events,
+        categories=selected_categories,
+        subject=selected_subject,
+        window_days=window_days,
+    ) if selected_categories else all_events.iloc[0:0].copy()
+
+    counts = filtered.get("event_category", pd.Series(dtype=str)).value_counts()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Regime", int(counts.get("Regime", 0)))
+    c2.metric("RRG", int(counts.get("RRG", 0)))
+    c3.metric("Portfolio", int(counts.get("Portfolio", 0)))
+    c4.metric("Data", int(counts.get("Data", 0)))
+    st.caption(f"{len(filtered)} changes match the current filters.")
+
+    if filtered.empty:
+        st.info("No changes match these filters.")
+        return
+    with st.container(border=True):
+        for row in filtered.head(20).itertuples(index=False):
+            date_label = pd.Timestamp(row.effective_market_date).strftime("%b %d, %Y") if not pd.isna(row.effective_market_date) else "Unknown date"
+            st.markdown(f"**{row.subject}** · {activity_event_label(row.event_type)}")
+            st.caption(f"{date_label} · {_text(row.old_value) or '—'} → {_text(row.new_value) or '—'}")
+            if _text(row.reason):
+                st.caption(_text(row.reason))
+    if len(filtered) > 20:
+        st.caption(f"Showing the latest 20 of {len(filtered)} changes. The audit table contains the full filtered history.")
+    with st.expander("Audit table & evidence"):
+        columns = [
+            "effective_market_date", "event_type", "subject", "old_value", "new_value",
+            "evidence_id", "reason", "benchmark", "signal_config_hash", "run_id", "evidence_json",
+        ]
+        st.dataframe(filtered[[column for column in columns if column in filtered.columns]], width="stretch", hide_index=True)
 
 
 def display_rankings(ranked: pd.DataFrame) -> object:
-    columns = [
-        "rank",
-        "symbol",
-        "name",
-        "theme",
-        "benchmark_adjusted_score",
-        "score",
-        "relative_strength_score",
-        "relative_strength_label",
-        "rs_3m",
-        "rs_6m",
-        "rs_12m",
-        "larsson_regime",
-        "larsson_regime_history",
-        "daily_trend",
-        "weekly_trend",
-        "monthly_trend",
-        "pass_200d_label",
-        "pass_200w_label",
-        "latest_close",
-        "drawdown_52w",
-        "extension_sma50d",
-        "extension_sma200d",
-        "extension_sma30w",
-        "data_warnings",
-    ]
-    existing = [column for column in columns if column in ranked.columns]
+    existing = [column for column in RANKING_DISPLAY_COLUMNS if column in ranked.columns]
     return st.dataframe(
         ranked[existing],
         width="stretch",
@@ -1185,17 +1855,10 @@ def main() -> None:
     larsson_history_weeks = st.sidebar.slider("Larsson history weeks", min_value=8, max_value=104, value=26, step=1)
     st.sidebar.subheader("Seed Universe")
     options = seed_universe_options()
-    # This runs before the widget is instantiated, so sessions that still hold
-    # the retired Mag7 + SpaceX value migrate without a stale-widget error.
-    st.session_state["seed_universe"] = seed_universe_label_after_migration(
-        st.session_state.get("seed_universe"), options
-    )
     seed_label = st.sidebar.selectbox(
         "Seed universe",
         options,
         index=options.index(DEFAULT_SEED_UNIVERSE),
-        format_func=seed_universe_display_name,
-        help="Choose the stock basket used for rankings and charts. The full universe name remains available after selection.",
     )
     active_seed = select_seed_universe(seed_label, seed_frames)
     default_text = "\n".join(active_seed["symbol"].tolist())
@@ -1207,41 +1870,22 @@ def main() -> None:
     require_200d = st.sidebar.checkbox("Require 200D pass", value=False)
     require_200w = st.sidebar.checkbox("Require 200W pass", value=False)
     use_relative_strength = st.sidebar.checkbox("Use relative strength in ranking", value=False)
-    sidebar_refresh_clicked = st.sidebar.button("Refresh cache")
-    # The Paper Portfolio control below requests a rerun, so the same explicit
-    # refresh path is used regardless of where the user starts it.
-    refresh_clicked = sidebar_refresh_clicked or bool(st.session_state.pop("paper_portfolio_refresh_requested", False))
-
-    requested_dashboard_view = st.session_state.pop("pending_dashboard_view", None)
-    st.session_state["dashboard_view"] = dashboard_view_after_pending_request(
-        st.session_state.get("dashboard_view"), requested_dashboard_view
-    )
-    active_view = st.segmented_control(
-        "Dashboard view",
-        VIEW_OPTIONS,
-        key="dashboard_view",
-        label_visibility="collapsed",
-    )
+    refresh_clicked = st.sidebar.button("Refresh cache")
 
     manual_symbols = parse_ticker_text(ticker_text)
     universe = build_active_universe(active_seed, manual_symbols)
     rrg_seed_labels = selected_rrg_seed_labels_for_fetch(
         st.session_state.get("rrg_view", "Stocks"),
         st.session_state.get("rrg_seed_universes", default_rrg_seed_universes()),
-    ) if active_view == "RRG" else []
+    )
     portfolio_data_enabled = bool(st.session_state.get("portfolio_data_enabled", False))
     portfolio_seed_labels_for_fetch = selected_portfolio_seed_labels_for_fetch(
         st.session_state.get("portfolio_seed_universes", default_portfolio_seed_universes()),
         portfolio_data_enabled,
-    ) if active_view == "Portfolio" else []
+    )
     rrg_seed_symbols = seed_symbols_for_labels(seed_frames, rrg_seed_labels)
     portfolio_seed_symbols = seed_symbols_for_labels(seed_frames, portfolio_seed_labels_for_fetch)
-    all_seed = all_seed_universe(seed_frames)
-    lab_uses_all_seeds = active_view == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
-    lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
-    paper_symbols = set(paper_valuation_symbols(db_path=DEFAULT_DB_PATH)) if active_view in {"Paper Portfolio", "Chatgptfolio Lab"} else set()
-    active_symbols = set(universe["symbol"]) if active_view not in {"Paper Portfolio", "System Health"} else set()
-    symbols = sorted(active_symbols.union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
+    symbols = sorted(set(universe["symbol"]).union(rrg_seed_symbols).union(portfolio_seed_symbols).union({benchmark}))
     refresh_key = st.session_state.get("refresh_key", 0)
     if refresh_clicked:
         refresh_key += 1
@@ -1250,12 +1894,7 @@ def main() -> None:
     st.title("CTO-Style Stock Ranking")
 
     try:
-        price_started_at = perf_counter()
-        cached_before = cached_symbol_count(symbols, DEFAULT_DB_PATH)
-        price_cache_state = session_cache_state("prices", (tuple(symbols), refresh_key, years))
         prices = cached_prices(tuple(symbols), refresh_key, refresh_clicked, years, str(DEFAULT_DB_PATH))
-        loaded_detail = "manual refresh" if refresh_clicked else ("warm local cache" if cached_before >= len(symbols) else f"loaded {max(0, len(symbols) - cached_before)} symbols")
-        record_timing("Price cache", price_started_at, price_cache_state, loaded_detail)
     except RuntimeError as exc:
         st.error(str(exc))
         return
@@ -1264,41 +1903,100 @@ def main() -> None:
         st.warning("No price data available yet. Refresh the cache after installing the required dependencies.")
         return
 
-    signals = pd.DataFrame()
-    ranked = pd.DataFrame()
-    needs_primary_signals = active_view not in {"Chatgptfolio Lab", "Paper Portfolio", "System Health"}
-    if needs_primary_signals:
-        config = SignalConfig(larsson_history_weeks=larsson_history_weeks)
-        active_signal_symbols = set(universe["symbol"]).union({benchmark})
-        signal_prices = prices_for_symbols(prices, active_signal_symbols)
-        signal_started_at = perf_counter()
-        signal_cache_state = session_cache_state("primary_signals", (tuple(sorted(active_signal_symbols)), benchmark, larsson_history_weeks, len(signal_prices), str(signal_prices["date"].max())))
-        signals = cached_signal_table(signal_prices, benchmark, larsson_history_weeks)
-        record_timing("Technical signals", signal_started_at, signal_cache_state, f"{len(active_signal_symbols)} symbols")
-        signals = signals.merge(universe, on="symbol", how="left")
-        signals[["name", "theme", "notes"]] = signals[["name", "theme", "notes"]].fillna("")
-        signals[["fundamental_score", "catalyst_score"]] = signals[["fundamental_score", "catalyst_score"]].fillna(0.0)
-        ranked = rank_universe(signals, RankingConfig(use_relative_strength=use_relative_strength))
-        if require_200d:
-            ranked = ranked[ranked["pass_200d"] == True].copy()
-        if require_200w:
-            ranked = ranked[ranked["pass_200w"] == True].copy()
-        ranked = ranked.reset_index(drop=True)
-        ranked["rank"] = range(1, len(ranked) + 1)
-        benchmark_row = signals[signals["symbol"] == benchmark]
-        benchmark_regime = benchmark_row["larsson_regime"].iloc[0] if not benchmark_row.empty else "n/a"
-        benchmark_close = benchmark_row["latest_close"].iloc[0] if not benchmark_row.empty else float("nan")
-        benchmark_drawdown = benchmark_row["drawdown_52w"].iloc[0] if not benchmark_row.empty else float("nan")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Benchmark", benchmark)
-        c2.metric("Benchmark Regime", benchmark_regime)
-        c3.metric("Benchmark Close", money(benchmark_close))
-        c4.metric("Benchmark 52W Drawdown", pct(benchmark_drawdown))
-        c5.metric("Cache Freshness", latest_cache_timestamp(DEFAULT_DB_PATH))
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Symbols Ranked", len(ranked))
-        s2.metric("Passing 200D", int((ranked["pass_200d"] == True).sum()) if not ranked.empty else 0)
-        s3.metric("Passing 200W", int((ranked["pass_200w"] == True).sum()) if not ranked.empty else 0)
+    fetch_log = load_fetch_log(DEFAULT_DB_PATH)
+    data_health = compute_data_health(prices, benchmark, lookback_sessions=60, fetch_log=fetch_log)
+    config = SignalConfig(larsson_history_weeks=larsson_history_weeks)
+    active_signal_symbols = set(universe["symbol"]).union({benchmark})
+    signal_prices = prices_for_symbols(prices, active_signal_symbols)
+    signals = cached_signal_table(signal_prices, benchmark, larsson_history_weeks)
+    signals = signals.merge(universe, on="symbol", how="left")
+    signals[["name", "theme", "notes"]] = signals[["name", "theme", "notes"]].fillna("")
+    signals[["fundamental_score", "catalyst_score"]] = signals[["fundamental_score", "catalyst_score"]].fillna(0.0)
+    analysis_signals = rank_universe(
+        signals,
+        RankingConfig(use_relative_strength=use_relative_strength, exclude_benchmark=False),
+    )
+    ranked = rank_universe(signals, RankingConfig(use_relative_strength=use_relative_strength))
+
+    if require_200d:
+        ranked = ranked[ranked["pass_200d"] == True].copy()
+    if require_200w:
+        ranked = ranked[ranked["pass_200w"] == True].copy()
+    ranked = ranked.reset_index(drop=True)
+    ranked["rank"] = range(1, len(ranked) + 1)
+
+    benchmark_row = signals[signals["symbol"] == benchmark]
+    benchmark_regime = benchmark_row["larsson_regime"].iloc[0] if not benchmark_row.empty else "n/a"
+    benchmark_close = benchmark_row["latest_close"].iloc[0] if not benchmark_row.empty else float("nan")
+    benchmark_drawdown = benchmark_row["drawdown_52w"].iloc[0] if not benchmark_row.empty else float("nan")
+
+    stable_rrg_config = RRGConfig()
+    stable_stock_rrg = cached_rrg_history(
+        signal_prices,
+        tuple(sorted(active_signal_symbols)),
+        benchmark,
+        stable_rrg_config.ratio_window_weeks,
+        stable_rrg_config.momentum_window_weeks,
+        stable_rrg_config.tail_weeks,
+    )
+    snapshot_seed_map = (
+        seed_universe_symbol_map(seed_frames, [seed_label])
+        if seed_label != MANUAL_ONLY_UNIVERSE
+        else {}
+    )
+    stable_seed_rrg = cached_rrg_basket_history(
+        prices,
+        snapshot_seed_map,
+        benchmark,
+        stable_rrg_config.ratio_window_weeks,
+        stable_rrg_config.momentum_window_weeks,
+        stable_rrg_config.tail_weeks,
+    ) if snapshot_seed_map else pd.DataFrame()
+
+    if refresh_clicked:
+        refresh_succeeded = refresh_batch_succeeded(fetch_log, tuple(symbols))
+        capture = capture_analysis_snapshot(
+            analysis_signals,
+            data_health,
+            benchmark,
+            active_signal_symbols,
+            signal_config=config,
+            stock_rrg=stable_stock_rrg,
+            seed_rrg=stable_seed_rrg,
+            refresh_succeeded=refresh_succeeded,
+            db_path=DEFAULT_DB_PATH,
+        )
+        if capture.captured:
+            if capture.baseline:
+                st.success("Refresh captured as the first comparable analysis baseline.")
+            else:
+                st.success(f"Refresh captured with {capture.event_count} new change event(s).")
+        else:
+            st.warning(f"Analysis snapshot not captured: {capture.diagnostic}")
+
+    latest_snapshot_rows, latest_run = load_latest_analysis_snapshot(DEFAULT_DB_PATH)
+    latest_run_events = (
+        load_signal_events(DEFAULT_DB_PATH, run_id=str(latest_run["run_id"]))
+        if latest_run
+        else pd.DataFrame()
+    )
+    overview = data_health_overview(data_health)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Benchmark / Regime", f"{benchmark} · {benchmark_regime}")
+    c2.metric("Market-data Date", overview["market_date"])
+    c3.metric("Fresh-symbol Coverage", f"{overview['fresh_pct']:.0f}%")
+    c4.metric("Stale Symbols", overview["stale_count"])
+    c5.metric("Changes Since Prior Snapshot", len(latest_run_events))
+
+    if st.session_state.get("dashboard_view") not in VIEW_OPTIONS:
+        st.session_state["dashboard_view"] = "Rankings"
+    active_view = st.segmented_control(
+        "Dashboard view",
+        VIEW_OPTIONS,
+        default=st.session_state["dashboard_view"],
+        key="dashboard_view",
+        label_visibility="collapsed",
+    )
 
     if active_view == "Rankings":
         display = ranked.copy()
@@ -1316,10 +2014,7 @@ def main() -> None:
         selected_from_table = symbol_from_dataframe_selection(ranking_event, ranked)
         if selected_from_table:
             st.session_state["detail_symbol"] = selected_from_table
-            # The navigation widget has already been created this run. Defer
-            # changing its state until the next rerun to satisfy Streamlit's
-            # widget-state contract.
-            st.session_state["pending_dashboard_view"] = "Detail"
+            st.session_state["dashboard_view"] = "Detail"
             st.rerun()
 
     elif active_view == "Detail":
@@ -1332,18 +2027,37 @@ def main() -> None:
                 st.session_state["detail_symbol"] = detail_symbols[0]
             selected = st.selectbox("Symbol", detail_symbols, key="detail_symbol")
             selected_row = ranked[ranked["symbol"] == selected].iloc[0]
-            d1, d2, d3, d4 = st.columns(4)
+            selected_health = data_health[data_health["symbol"] == selected]
+            freshness = selected_health["freshness_status"].iloc[0] if not selected_health.empty else "Unknown"
+            d1, d2, d3, d4, d5 = st.columns(5)
             d1.metric("Score", f"{selected_row['score']:.1f}")
             d2.metric("Latest", money(selected_row["latest_close"]))
             d3.metric("52W Drawdown", pct(selected_row["drawdown_52w"]))
             d4.metric("Extension vs 200D", pct(selected_row["extension_sma200d"]))
+            d5.metric("Data Freshness", freshness)
 
             daily_history = price_history_with_indicators(prices, selected, config)
             weekly_history = weekly_history_with_indicators(prices, selected, config)
             dd_history = drawdown_history(prices, selected)
             st.plotly_chart(price_chart(daily_history, selected), use_container_width=True)
             st.plotly_chart(weekly_chart(weekly_history, selected), use_container_width=True)
+            st.caption(DERIVED_200W_NOTE)
             st.plotly_chart(drawdown_chart(dd_history, selected), use_container_width=True)
+
+            notes = str(selected_row.get("notes", "") or "").strip()
+            st.caption(f"Seed notes (read-only): {notes or 'None'}")
+            ticker_events = load_signal_events(DEFAULT_DB_PATH, symbol=selected, limit=100)
+            with st.expander("Recent signal timeline", expanded=not ticker_events.empty):
+                if ticker_events.empty:
+                    st.info("No logged changes for this ticker yet. Changes begin after two comparable refresh snapshots.")
+                else:
+                    st.dataframe(
+                        ticker_events[
+                            ["effective_market_date", "event_type", "old_value", "new_value", "evidence_id", "reason"]
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
 
             raw_columns = [
                 "symbol",
@@ -1575,27 +2289,7 @@ def main() -> None:
                     st.info("No seed RRG rows available. Try a longer price history or fewer smoothing weeks.")
                 else:
                     latest_seed_history = latest_seed_rrg(seed_history)
-                    selected_rrg_seed = st.session_state.get("selected_rrg_seed")
-                    if selected_rrg_seed not in set(selected_seed_labels):
-                        selected_rrg_seed = None
-                        st.session_state["selected_rrg_seed"] = None
-                    if selected_rrg_seed:
-                        st.caption(f"Focused RRG seed universe: {selected_rrg_seed}. Click it again to clear the focus.")
-                    else:
-                        st.caption("Click a seed-universe dot to highlight its current point and recent path.")
-                    seed_fig = rrg_seed_chart(seed_history, latest_seed_history, benchmark, selected_seed=selected_rrg_seed)
-                    seed_event = st.plotly_chart(
-                        seed_fig,
-                        use_container_width=True,
-                        key="rrg_seed_chart",
-                        on_select="rerun",
-                        selection_mode="points",
-                    )
-                    clicked_seed = rrg_selection_from_event(seed_event, seed_fig)
-                    new_selected_seed = toggle_rrg_selection(selected_rrg_seed, clicked_seed)
-                    if new_selected_seed != selected_rrg_seed:
-                        st.session_state["selected_rrg_seed"] = new_selected_seed
-                        st.rerun()
+                    st.plotly_chart(rrg_seed_chart(seed_history, latest_seed_history, benchmark), use_container_width=True)
                     st.dataframe(
                         latest_seed_history[
                             [
@@ -1624,17 +2318,16 @@ def main() -> None:
             help="Seed presets eligible for the model portfolio.",
         )
         pc1, pc2, pc3, pc4 = st.columns(4)
-        max_holdings = pc1.slider("Max holdings", min_value=4, max_value=25, value=12, step=1, help="Maximum number of stocks the allocator may hold; cash can still be retained.")
-        top_per_seed = pc2.slider("Top candidates per seed", min_value=2, max_value=10, value=5, step=1, help="How many highest-ranked candidates each selected seed universe contributes to the allocation pool.")
-        max_position_pct = pc3.slider("Max position", min_value=5, max_value=25, value=12, step=1, help="Largest allowed weight for any individual stock after allocation.")
-        max_seed_exposure_pct = pc4.slider("Max seed exposure", min_value=20, max_value=80, value=45, step=5, help="Largest combined weight allowed for stocks from one seed universe.")
+        max_holdings = pc1.slider("Max holdings", min_value=4, max_value=25, value=12, step=1)
+        top_per_seed = pc2.slider("Top candidates per seed", min_value=2, max_value=10, value=5, step=1)
+        max_position_pct = pc3.slider("Max position", min_value=5, max_value=25, value=12, step=1)
+        max_seed_exposure_pct = pc4.slider("Max seed exposure", min_value=20, max_value=80, value=45, step=5)
 
         pc5, pc6, pc7 = st.columns(3)
-        sensitivity = pc5.selectbox("Allocator sensitivity", list(SENSITIVITY_PROFILES), index=1, help="Controls how readily the allocator accepts portfolio changes: Conservative needs stronger evidence; Aggressive changes more readily.")
-        use_portfolio_rs = pc6.checkbox("Use relative strength", value=True, help="Blend each stock's relative performance versus the selected benchmark into its ranking score.")
-        allow_weak_candidates = pc7.checkbox("Allow weak-regime candidates", value=False, help="Include candidates whose Larsson-proxy regime is Bear. By default, those candidates are excluded.")
-        include_cash_rule = st.checkbox("Use benchmark-regime cash rule", value=True, help="Reserve at least 15% cash in a Transition benchmark regime and 35% in a Bear regime. Turn this off to target no regime-driven cash reserve.")
-        st.caption(benchmark_regime_cash_rule_status(benchmark_regime, include_cash_rule))
+        sensitivity = pc5.selectbox("Allocator sensitivity", list(SENSITIVITY_PROFILES), index=1)
+        use_portfolio_rs = pc6.checkbox("Use relative strength", value=True)
+        allow_weak_candidates = pc7.checkbox("Allow weak-regime candidates", value=False)
+        include_cash_rule = st.checkbox("Use benchmark-regime cash rule", value=True)
 
         portfolio_config = PortfolioConfig(
             selected_seeds=tuple(selected_portfolio_seeds),
@@ -1666,10 +2359,7 @@ def main() -> None:
                     "Some selected portfolio symbols are not cached yet. Use Refresh cache to fetch: "
                     + ", ".join(missing_portfolio_symbols[:20])
                 )
-            portfolio_signal_started_at = perf_counter()
-            portfolio_signal_cache_state = session_cache_state("portfolio_signals", (tuple(sorted(portfolio_symbols)), benchmark, larsson_history_weeks, len(portfolio_prices), str(portfolio_prices["date"].max())))
             portfolio_signals = cached_signal_table(portfolio_prices, benchmark, larsson_history_weeks)
-            record_timing("Portfolio technical ranking", portfolio_signal_started_at, portfolio_signal_cache_state, f"{len(portfolio_symbols)} symbols")
             portfolio_signals = portfolio_signals.merge(
                 portfolio_membership.drop_duplicates("symbol", keep="first"),
                 on="symbol",
@@ -1722,15 +2412,17 @@ def main() -> None:
 
             if st.button("Save current allocation as baseline"):
                 saved_changes, _ = compare_portfolios(previous_portfolio, applied_target, portfolio_config)
+                snapshot_metadata = portfolio_snapshot_metadata(benchmark, benchmark_regime, portfolio_config)
+                snapshot_metadata["effective_market_date"] = overview["market_date"]
                 snapshot_id = save_portfolio_snapshot(
                     applied_target,
-                    portfolio_snapshot_metadata(benchmark, benchmark_regime, portfolio_config),
+                    snapshot_metadata,
                     saved_changes,
                     DEFAULT_DB_PATH,
                 )
-                st.success(f"Saved portfolio snapshot #{snapshot_id}.")
+                st.success(f"Saved paper-allocation snapshot #{snapshot_id}.")
 
-            target_display = applied_target.copy()
+            target_display = portfolio_allocation_display(applied_target, portfolio_ranked)
             for column in ["weight", "drawdown_52w", "extension_sma50d"]:
                 if column in target_display.columns:
                     target_display[column] = target_display[column] * 100
@@ -1777,6 +2469,20 @@ def main() -> None:
                         candidate_display[column] = candidate_display[column] * 100
                 st.dataframe(candidate_display, width="stretch", hide_index=True)
 
+            with st.expander("Deterministic allocator evidence preview"):
+                st.code(
+                    build_allocator_prompt(
+                        previous_portfolio,
+                        applied_target,
+                        changes,
+                        suppressed,
+                        benchmark,
+                        benchmark_regime,
+                        portfolio_config,
+                    ),
+                    language="json",
+                )
+
             with st.expander("Saved Rebalance Log"):
                 show_all_logs = st.checkbox("Show all saved rebalance logs", value=False)
                 matching_snapshot_id = previous_metadata.get("snapshot_id") if previous_metadata else None
@@ -1789,438 +2495,28 @@ def main() -> None:
                         log[column] = log[column] * 100
                 st.dataframe(log, width="stretch", hide_index=True, column_config=portfolio_change_column_config())
 
-    elif active_view == "Chatgptfolio Lab":
-        st.title("Chatgptfolio Lab")
-        st.caption("Auditable OpenAI research and paper trading. This does not place real trades or provide investment advice.")
-        lab_candidate_universe = st.radio("Candidate universe", ["All seed tickers", "Current selected seed"], horizontal=True, key="lab_candidate_universe", help="All seed tickers technically ranks the deduplicated union before research is bounded to the top 30.")
-        lab_universe = all_seed if lab_candidate_universe == "All seed tickers" else universe
-        lab_signal_prices = prices_for_symbols(prices, set(lab_universe["symbol"]).union({benchmark}))
-        lab_signal_started_at = perf_counter()
-        lab_signal_cache_state = session_cache_state("lab_signals", (lab_candidate_universe, tuple(sorted(lab_universe["symbol"])), benchmark, larsson_history_weeks, len(lab_signal_prices), str(lab_signal_prices["date"].max())))
-        lab_signals = cached_signal_table(lab_signal_prices, benchmark, larsson_history_weeks)
-        record_timing("Lab technical ranking", lab_signal_started_at, lab_signal_cache_state, f"{len(lab_universe)} symbols")
-        lab_signals = lab_signals.merge(lab_universe, on="symbol", how="left")
-        for column in ["name", "theme", "notes"]:
-            if column in lab_signals:
-                lab_signals[column] = lab_signals[column].fillna("")
-        for column in ["fundamental_score", "catalyst_score"]:
-            if column in lab_signals:
-                lab_signals[column] = lab_signals[column].fillna(0.0)
-        lab_ranked = rank_universe(lab_signals, RankingConfig(use_relative_strength=use_relative_strength))
-        if require_200d:
-            lab_ranked = lab_ranked[lab_ranked["pass_200d"] == True].copy()
-        if require_200w:
-            lab_ranked = lab_ranked[lab_ranked["pass_200w"] == True].copy()
-        lab_ranked = lab_ranked.reset_index(drop=True)
-        lab_ranked["rank"] = range(1, len(lab_ranked) + 1)
-        lab_candidates = lab_ranked.head(30).copy()
-        lab_state = st.session_state.get("lab_state", {})
-        # Every approved proposal starts an isolated experiment, so no prior
-        # experiment's positions are inputs to a new model decision.
-        lab_held_symbols: list[str] = []
-
-        st.subheader("1. Run setup")
-        lc1, lc2, lc3, lc4 = st.columns(4)
-        selected_model = lc1.selectbox("OpenAI model", MODEL_OPTIONS, index=MODEL_OPTIONS.index(DEFAULT_MODEL), help="Model choice is recorded per run; there is no automatic fallback.")
-        as_of_date = date.today()
-        lc2.metric("Research date", as_of_date.isoformat(), help="Live Lab decisions are current-date research only. Historical replay stays disabled until every source has an archived point-in-time packet.")
-        paper_capital = 100_000.0
-        lc3.metric("Experiment capital", money(paper_capital), help="Every approved run opens a separate, independent paper experiment at this nominal capital.")
-        slippage_bps = lc4.number_input("Slippage (bps)", min_value=0.0, value=5.0, step=1.0)
-        lc5, lc6, lc7 = st.columns(3)
-        lab_max_holdings = lc5.slider("Maximum holdings", 1, 15, 12)
-        lab_max_position = lc6.slider("Maximum position (%)", 1, 25, 12) / 100
-        commission_bps = lc7.number_input("Commission (bps)", min_value=0.0, value=0.0, step=0.5)
-        lc8, lc9 = st.columns(2)
-        lab_max_sector = lc8.slider("Maximum sector exposure (%)", 10, 80, 40, step=5) / 100
-        refresh_research = lc9.checkbox("Refresh SEC, FRED, and filing evidence", value=True, help="Refreshes the broader public research packet when an analysis is run. Recent ticker news is always refreshed for an analysis.")
-        lab_config = LabConfig(model=selected_model, max_holdings=lab_max_holdings, max_position=lab_max_position, max_sector_exposure=lab_max_sector, paper_capital=paper_capital, slippage_bps=slippage_bps, commission_bps=commission_bps)
-
-        st.subheader("Connection & Data Health")
-        last_model_error = st.session_state.get("lab_credential_error")
-        credential = credential_status(last_model_error)
-        health_one, health_two, health_three = st.columns(3)
-        health_one.metric("OpenAI credential", credential.title())
-        cached_all_seed_count = cached_symbol_count(all_seed["symbol"], DEFAULT_DB_PATH) if lab_candidate_universe == "All seed tickers" else 0
-        health_two.metric("All-seeds cache", f"{cached_all_seed_count}/{len(all_seed)} tickers" if lab_candidate_universe == "All seed tickers" else "Focused seed")
-        health_three.metric("Price cache", latest_cache_timestamp(DEFAULT_DB_PATH))
-        if lab_candidate_universe == "All seed tickers":
-            st.caption("First all-seeds load may take longer; subsequent runs reuse the local DuckDB price cache.")
-        if credential == "missing":
-            st.warning("No credential is available to the app. The key is never displayed or stored in DuckDB.")
-        elif credential == "rejected":
-            st.error("The last OpenAI request was rejected. Replace the credential, then rerun; the key is never displayed here.")
-
-        st.subheader("2. Research packet")
-        packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False, prices=lab_signal_prices, held_symbols=lab_held_symbols)
-        display_packet = lab_state.get("packet", packet)
-        source_status, coverage_status, candidate_status = st.columns(3)
-        source_status.metric("Price source", display_packet["coverage"]["prices"].title())
-        coverage_status.metric("Research completeness", "Ready to refresh" if refresh_research else "Cached prices only")
-        candidate_status.metric("Candidates", len(lab_candidates))
-        st.caption(f"{len(lab_ranked)} technically eligible tickers were ranked; only the top {len(lab_candidates)} enter the bounded research packet. Missing sources remain explicit and are never filled by model inference.")
-        st.subheader("Research Overview")
-        health = evidence_health(display_packet)
-        severity_dot_strip(health, "Evidence health")
-        st.dataframe(pd.DataFrame(health), width="stretch", hide_index=True)
-        macro = display_packet.get("macro", {})
-        if macro.get("series"):
-            st.caption(f"Macro regime: **{macro.get('regime', 'unavailable')}**")
-            st.dataframe(pd.DataFrame(macro["series"]).T, width="stretch", hide_index=False)
-        correlation_preview = display_packet.get("correlations", {})
-        if correlation_preview:
-            st.caption(f"Correlation coverage: {correlation_preview.get('daily_window', 50)} trading days / {correlation_preview.get('weekly_window', 26)} weeks. High-pair threshold: 0.80.")
-            high_pairs = pd.DataFrame(correlation_preview.get("high_correlation_pairs", []))
-            if not high_pairs.empty:
-                st.warning("High-correlation candidate pairs are a diversification warning, not an automatic exclusion.")
-                st.dataframe(high_pairs, width="stretch", hide_index=True)
-        with st.expander("Immutable packet audit (raw JSON)"):
-            st.json(display_packet)
-
-        st.subheader("3. Candidate review")
-        review = lab_ranked.copy()
-        if "seed_memberships" in review:
-            membership_options = sorted({seed for value in review["seed_memberships"].dropna() for seed in str(value).split(" · ")})
-            membership_filter = st.multiselect("Filter all-seeds review by membership", membership_options)
-            if membership_filter:
-                review = review[review["seed_memberships"].map(lambda value: bool(set(str(value).split(" · ")).intersection(membership_filter)))]
-        review_columns = [column for column in ["rank", "symbol", "name", "seed_memberships", "theme", "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score", "larsson_regime", "daily_trend", "weekly_trend", "monthly_trend", "data_warnings"] if column in review]
-        st.dataframe(review[review_columns], width="stretch", hide_index=True)
-
-        if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
-            research_started_at = perf_counter()
-            packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research, refresh_news=True, prices=lab_signal_prices, held_symbols=lab_held_symbols)
-            record_timing("Research collection", research_started_at, "live refresh" if refresh_research else "packet-only", f"{len(packet.get('evidence', []))} evidence records")
-            for source, duration_ms in packet.get("connector_timings_ms", {}).items():
-                record_duration(f"{str(source).title()} connector", float(duration_ms), "sequential public source", str(packet.get("coverage", {}).get(source, "unknown")))
-            packet_hash = save_lab_research_snapshot(packet, DEFAULT_DB_PATH)
-            save_lab_research_details(packet_hash, packet, DEFAULT_DB_PATH)
-            readiness = preflight_packet(packet, credential)
-            if not readiness.valid:
-                run_id = save_lab_run({
-                    "as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model,
-                    "status": "preflight_blocked", "packet_hash": packet_hash,
-                    "config_json": json.dumps(lab_config_payload(lab_config)),
-                    "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)),
-                    "error_message": "; ".join(readiness.errors),
-                }, DEFAULT_DB_PATH)
-                st.error(f"Analysis was not run (record #{run_id}): " + "; ".join(readiness.errors))
-                return
-            try:
-                model_started_at = perf_counter()
-                model_decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
-                record_timing("OpenAI proposal", model_started_at, "live API", selected_model)
-                previous_weights = pd.DataFrame(columns=["symbol", "weight"])
-                decision = optimize_decision(model_decision, lab_candidates, lab_config, previous_weights)
-                validation = validate_decision(decision, lab_candidates, lab_config, previous_weights, packet=packet)
-                status = "proposal_ready" if validation.valid else "validation_failed"
-                run_id = save_lab_run({
-                    "as_of_date": as_of_date,
-                    "benchmark": benchmark,
-                    "model": selected_model,
-                    "returned_model": returned_model,
-                    "status": status,
-                    "packet_hash": packet_hash,
-                    "prompt_hash": decision_hash({"packet": packet, "config": lab_config_payload(lab_config)}),
-                    "config_json": json.dumps(lab_config_payload(lab_config)),
-                    "request_settings_json": json.dumps({"reasoning_effort": "high" if selected_model == DEFAULT_MODEL else "medium", "response_format": "strict_json_schema"}),
-                    "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)),
-                    "response_json": json.dumps({"model_decision": model_decision, "optimized_decision": decision}),
-                    "raw_response": raw_response,
-                    "validation_json": json.dumps({"valid": validation.valid, "errors": validation.errors, "warnings": validation.warnings}),
-                }, DEFAULT_DB_PATH)
-                st.session_state.pop("lab_credential_error", None)
-                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model, "packet": packet, "config": lab_config_payload(lab_config), "as_of_date": as_of_date.isoformat()}
-                st.rerun()
-            except Exception as exc:
-                st.session_state["lab_credential_error"] = str(exc)
-                run_id = save_lab_run({"as_of_date": as_of_date, "benchmark": benchmark, "model": selected_model, "status": "model_failed", "packet_hash": packet_hash, "config_json": json.dumps(lab_config_payload(lab_config)), "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)), "error_message": str(exc)}, DEFAULT_DB_PATH)
-                st.error(f"Analysis was not run (record #{run_id}): {exc}")
-
-        st.subheader("4. ChatGPT proposal")
-        if not lab_state:
-            st.info("No proposal yet. Run the analysis after reviewing the research packet.")
-        else:
-            validation = lab_state["validation"]
-            decision = lab_state["decision"]
-            state1, state2, state3 = st.columns(3)
-            state1.metric("Model", lab_state["model"])
-            state2.metric("Validation", "Ready" if validation.valid else "Failed")
-            state3.metric("Run ID", lab_state["run_id"])
-            if validation.valid:
-                st.success("Proposal passed deterministic limits. Review before approving paper orders.")
-            else:
-                st.error("Proposal is blocked: " + "; ".join(validation.errors))
-            if decision.get("abstain_reason"):
-                st.warning("Model abstained: " + str(decision["abstain_reason"]))
-            for warning in validation.warnings:
-                st.warning("Diversification: " + warning)
-            st.write(decision.get("portfolio_thesis", ""))
-            optimization = decision.get("optimization", {})
-            if optimization:
-                st.caption(f"Deterministic allocator: {optimization.get('allocated_equity', 0):.1%} equity / {decision.get('cash_weight', 0):.1%} cash. Binding constraints: {', '.join(optimization.get('binding_constraints', [])) or 'none'}.")
-            proposal = pd.DataFrame(decision.get("holdings", []))
-            if proposal.empty:
-                st.info("No holdings proposed.")
-            else:
-                entry_lookup = {str(candidate.get("symbol", "")): candidate.get("entry", {}) for candidate in lab_state.get("packet", {}).get("candidates", [])}
-                proposal["entry_label"] = proposal["symbol"].map(lambda symbol: entry_lookup.get(str(symbol), {}).get("entry_label", "Unresolved"))
-                proposal["preferred_entry_zone"] = proposal["symbol"].map(lambda symbol: "–" if not entry_lookup.get(str(symbol), {}).get("preferred_entry_low") else f"${entry_lookup[str(symbol)]['preferred_entry_low']:.2f}–${entry_lookup[str(symbol)]['preferred_entry_high']:.2f}")
-                st.dataframe(proposal, width="stretch", hide_index=True)
-
-            st.subheader("Entry and diversification guidance")
-            deterministic = pd.DataFrame([
-                {"symbol": candidate.get("symbol"), **candidate.get("entry", {}), **{key: value for key, value in candidate.get("correlation", {}).items() if key in {"average_daily_correlation", "max_daily_correlation", "average_correlation_to_held", "cluster", "status"}}}
-                for candidate in lab_state.get("packet", {}).get("candidates", [])
-                if str(candidate.get("symbol", "")) in set(proposal.get("symbol", []))
-            ])
-            if not deterministic.empty:
-                st.dataframe(deterministic, width="stretch", hide_index=True)
-            correlations = lab_state.get("packet", {}).get("correlations", {})
-            matrix = pd.DataFrame(correlations.get("daily_matrix", {}))
-            if not matrix.empty:
-                matrix = matrix.reindex(index=matrix.columns, columns=matrix.columns)
-                st.plotly_chart(go.Figure(data=go.Heatmap(z=matrix.values, x=matrix.columns, y=matrix.index, zmin=-1, zmax=1, colorscale="RdBu", reversescale=True, colorbar={"title": "50D corr"})).update_layout(height=440, margin={"l": 10, "r": 10, "t": 20, "b": 10}), use_container_width=True, config={"displayModeBar": False})
-
-            risk_items = []
-            for flag in decision.get("portfolio_risks", []):
-                if isinstance(flag, dict):
-                    risk_items.append({"symbol": "Portfolio", **flag})
-            for holding in decision.get("holdings", []):
-                if isinstance(holding, dict):
-                    for flag in holding.get("risk_flags", []):
-                        if isinstance(flag, dict):
-                            risk_items.append({"symbol": holding.get("symbol", ""), **flag})
-            st.subheader("Investment risk")
-            severity_dot_strip(risk_items, "Model-assessed risks")
-            if risk_items:
-                st.dataframe(pd.DataFrame(risk_items), width="stretch", hide_index=True)
-            else:
-                st.info("No model risk flags were returned for this run.")
-
-            st.subheader("Candidate evidence")
-            packet_evidence = pd.DataFrame(lab_state.get("packet", {}).get("evidence", []))
-            for candidate in lab_state.get("packet", {}).get("candidates", []):
-                symbol = candidate.get("symbol", "")
-                with st.expander(f"{symbol} — score {candidate.get('combined_score', 'n/a')}"):
-                    st.json({key: candidate.get(key) for key in ["name", "seed_memberships", "sector", "technical_score", "fundamental_score", "combined_score", "fundamental_factors", "entry", "correlation"] if key in candidate})
-                    rows = packet_evidence[packet_evidence["symbol"] == symbol] if not packet_evidence.empty and "symbol" in packet_evidence else pd.DataFrame()
-                    if rows.empty:
-                        st.warning("No refreshed company evidence was included; treat this candidate as unresolved.")
-                    else:
-                        st.dataframe(rows[[column for column in ["category", "title", "publisher", "source_tier", "source_domain", "published_at", "status", "source_url"] if column in rows]], width="stretch", hide_index=True)
-
-            st.subheader("5. Paper rebalance")
-            prior_weights = pd.DataFrame(columns=["symbol", "weight"])
-            orders = paper_orders(prior_weights, decision, lab_config)
-            if orders.empty:
-                st.info("No paper orders proposed.")
-            else:
-                orders_display = orders.copy()
-                for column in ["previous_weight", "target_weight"]:
-                    orders_display[column] = orders_display[column] * 100
-                st.dataframe(orders_display, width="stretch", hide_index=True)
-                if validation.valid and st.button("Approve paper rebalance", type="primary"):
-                    rebalance_id = approve_paper_rebalance(
-                        int(lab_state["run_id"]), decision, lab_state.get("config", lab_config_payload(lab_config)),
-                        date.fromisoformat(lab_state.get("as_of_date", as_of_date.isoformat())), db_path=DEFAULT_DB_PATH,
-                    )
-                    st.success(f"Independent $100,000 experiment approved (rebalance #{rebalance_id}). It will fill at the next cached market open; no broker was contacted.")
-
-            with st.expander("Decision audit"):
-                st.json(decision)
-
-            with st.expander("Research evidence used"):
-                evidence = pd.DataFrame(lab_state.get("packet", {}).get("evidence", []))
-                if evidence.empty:
-                    st.info("No refreshed external evidence was included in this run.")
-                else:
-                    st.dataframe(evidence[[column for column in ["symbol", "category", "title", "publisher", "source_tier", "source_domain", "published_at", "status", "source_url"] if column in evidence]], width="stretch", hide_index=True)
-
-        st.subheader("6. Audit & performance")
-        runs = load_lab_runs(DEFAULT_DB_PATH)
-        if runs.empty:
-            st.info("No prior lab runs saved.")
-        else:
-            st.dataframe(runs, width="stretch", hide_index=True)
-            st.caption("Runs preserve immutable packets and source timestamps. Historical model replay is disabled until every source is archived with point-in-time availability metadata.")
-
-    elif active_view == "Paper Portfolio":
-        st.title("Paper Portfolio")
-        st.caption("Every approved proposal creates an isolated $100,000 paper experiment. No experiment shares cash, positions, fills, or NAV with another.")
-        if st.button("Refresh market data", icon=":material/refresh:", help="Fetch current prices for the paper holdings and benchmarks, then process any eligible pending paper rebalance."):
-            st.session_state["paper_portfolio_refresh_requested"] = True
-            st.rerun()
-        valuation_started_at = perf_counter()
-        completed_rebalances = execute_pending_paper_rebalances(prices, DEFAULT_DB_PATH)
-        experiments = load_paper_experiments(DEFAULT_DB_PATH)
-        for portfolio_id in experiments.get("portfolio_id", pd.Series(dtype=int)).tolist():
-            rebuild_paper_nav(prices, int(portfolio_id), DEFAULT_DB_PATH, force=bool(completed_rebalances))
-        record_timing(
-            "Paper NAV refresh", valuation_started_at,
-            "rebuilt after fill" if completed_rebalances else "valuation fingerprint reused when unchanged",
-            f"{len(completed_rebalances)} new fills",
+    elif active_view == "Activity":
+        st.subheader("Activity")
+        activity_mode = st.segmented_control(
+            "Activity view",
+            ["Weekly Brief", "Change Log"],
+            default="Weekly Brief",
+            key="activity_mode",
+            label_visibility="collapsed",
         )
-        experiments = load_paper_experiments(DEFAULT_DB_PATH)
-        st.subheader("Experiments")
-        if experiments.empty:
-            st.info("No independent experiment exists yet. Approve a validated Lab proposal to create one; it will remain pending until its next cached market open.")
+        if activity_mode == "Change Log":
+            _render_change_log()
         else:
-            experiment_table = experiments.copy()
-            experiment_table["pending_state"] = experiment_table["has_pending"].map(lambda pending: "Pending next open" if pending else "Filled")
-            experiment_table["return"] = experiment_table["return"].map(pct)
-            experiment_table["drawdown"] = experiment_table["drawdown"].map(pct)
-            experiment_table["nav"] = experiment_table["nav"].map(money)
-            experiment_table = experiment_table.rename(columns={"name": "experiment", "sensitivity": "sensitivity", "basket_description": "basket"})
-            st.dataframe(
-                experiment_table[[column for column in ["experiment", "sensitivity", "basket", "model", "run_id", "status", "approval_date", "fill_date", "nav", "return", "drawdown", "holding_count", "pending_state"] if column in experiment_table]],
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "experiment": st.column_config.TextColumn("Experiment"),
-                    "sensitivity": st.column_config.TextColumn("Sensitivity", help="Frozen turnover sensitivity from the approved Lab run."),
-                    "basket": st.column_config.TextColumn("Basket", help="Brief summary of the largest themes in the approved holdings."),
-                },
-            )
-
-            experiment_options = experiments["portfolio_id"].astype(int).tolist()
-            experiment_names = {
-                int(row["portfolio_id"]): paper_experiment_display_name(row)
-                for _, row in experiments.iterrows()
-            }
-            selected_experiments = st.multiselect(
-                "Compare active experiments",
-                experiment_options,
-                default=experiment_options,
-                format_func=lambda portfolio_id: experiment_names[int(portfolio_id)],
-                help="Each experiment is normalized to its own $100,000 start. Shared market references use the earliest selected filled experiment.",
-            )
-            selected_summary = experiments[experiments["portfolio_id"].isin(selected_experiments)]
-            comparison_warning = paper_comparison_start_warning(selected_summary)
-            if comparison_warning:
-                st.warning(comparison_warning)
-            if not selected_experiments:
-                st.info("Select one or more experiments to compare their performance.")
-            else:
-                comparison = go.Figure()
-                plotted = False
-                comparison_dashboards: dict[int, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
-                for portfolio_id in selected_experiments:
-                    nav, benchmarks, rebalances, _ = load_paper_portfolio_dashboard(int(portfolio_id), DEFAULT_DB_PATH)
-                    comparison_dashboards[int(portfolio_id)] = (nav, benchmarks, rebalances)
-                    normalized_nav = normalize_paper_series(nav)
-                    if normalized_nav.empty:
-                        continue
-                    experiment_name = experiment_names[int(portfolio_id)]
-                    comparison.add_trace(go.Scatter(x=normalized_nav["date"], y=normalized_nav["normalized_nav"], name=experiment_name, line={"width": 3}))
-                    plotted = True
-                    executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
-                    if not executed.empty:
-                        markers = normalized_nav.merge(executed[["effective_date", "rebalance_id"]], left_on="date", right_on="effective_date", how="inner")
-                        if not markers.empty:
-                            comparison.add_trace(go.Scatter(x=markers["date"], y=markers["normalized_nav"], mode="markers", name=f"{experiment_name} fill", marker={"size": 9, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
-                benchmark_anchor_id = paper_comparison_benchmark_anchor(selected_summary)
-                if benchmark_anchor_id is not None and benchmark_anchor_id in comparison_dashboards:
-                    _, anchor_benchmarks, _ = comparison_dashboards[benchmark_anchor_id]
-                    for symbol, normalized_benchmark in shared_market_benchmark_series(anchor_benchmarks).items():
-                        comparison.add_trace(go.Scatter(x=normalized_benchmark["date"], y=normalized_benchmark["normalized_nav"], name=symbol, line={"width": 1.25, "dash": "dot"}, visible=paper_chart_trace_visibility(symbol)))
-                if plotted:
-                    comparison.update_layout(height=460, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Normalized value ($100,000 start)")
-                    st.plotly_chart(comparison, use_container_width=True, config={"displayModeBar": False})
-                    if benchmark_anchor_id is not None:
-                        anchor = selected_summary[selected_summary["portfolio_id"] == benchmark_anchor_id].iloc[0]
-                        anchor_date = pd.to_datetime(anchor["fill_date"]).date().isoformat()
-                        st.caption(f"Shared SPY, QQQ, GLD, and BTC-USD references are anchored to {experiment_names[benchmark_anchor_id]}'s {anchor_date} fill. TECHNICAL is run-specific and appears only in Experiment detail.")
-                    else:
-                        st.caption("Shared market references begin once a selected experiment has filled. TECHNICAL is run-specific and appears only in Experiment detail.")
-                else:
-                    st.info("The selected experiments are pending. Their comparison series will begin at the eligible cached market open.")
-
-            selected_detail_id = st.selectbox(
-                "Experiment detail",
-                experiment_options,
-                format_func=lambda portfolio_id: experiment_names[int(portfolio_id)],
-            )
-            detail = experiments[experiments["portfolio_id"] == selected_detail_id].iloc[0]
-            nav, benchmarks, rebalances, positions = load_paper_portfolio_dashboard(int(selected_detail_id), DEFAULT_DB_PATH)
-            fills = load_paper_fills(int(selected_detail_id), DEFAULT_DB_PATH)
-            executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
-            pending = rebalances[rebalances["status"] == "pending"] if not rebalances.empty else rebalances
-            st.subheader(experiment_names[int(selected_detail_id)])
-            st.caption("The sensitivity and basket description are derived from this experiment's frozen approval; the run ID, decision, and audit packet remain unchanged.")
-            metric_one, metric_two, metric_three, metric_four = st.columns(4)
-            metric_one.metric("NAV", money(detail["nav"]), pct(detail["return"]))
-            metric_two.metric("Max drawdown", pct(detail["drawdown"]))
-            metric_three.metric("Holdings", str(int(detail["holding_count"])))
-            metric_four.metric("State", "Pending next open" if bool(detail["has_pending"]) else "Filled")
-            if nav.empty:
-                st.info("This experiment has not filled yet. Its frozen decision will remain pending until every required holding has a cached opening price after the research date.")
-                if not pending.empty:
-                    st.dataframe(pending[[column for column in ["rebalance_id", "run_id", "approved_at", "status", "note"] if column in pending]], width="stretch", hide_index=True)
-            else:
-                detail_chart = go.Figure()
-                normalized_nav = normalize_paper_series(nav)
-                detail_chart.add_trace(go.Scatter(x=normalized_nav["date"], y=normalized_nav["normalized_nav"], name="Experiment", line={"width": 3, "color": "#2563eb"}))
-                for symbol, benchmark_rows in benchmarks.groupby("symbol") if not benchmarks.empty else []:
-                    normalized_benchmark = normalize_paper_series(benchmark_rows)
-                    if not normalized_benchmark.empty:
-                        detail_chart.add_trace(go.Scatter(x=normalized_benchmark["date"], y=normalized_benchmark["normalized_nav"], name=str(symbol), line={"width": 1.5}, visible=paper_chart_trace_visibility(symbol)))
-                if not executed.empty:
-                    markers = normalized_nav.merge(executed[["effective_date", "rebalance_id"]], left_on="date", right_on="effective_date", how="inner")
-                    if not markers.empty:
-                        detail_chart.add_trace(go.Scatter(x=markers["date"], y=markers["normalized_nav"], mode="markers", name="Fill", marker={"size": 10, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
-                detail_chart.update_layout(height=430, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Normalized value ($100,000 start)")
-                st.plotly_chart(detail_chart, use_container_width=True, config={"displayModeBar": False})
-            st.subheader("Current holdings")
-            if positions.empty:
-                st.info("No filled positions yet.")
-            else:
-                st.dataframe(positions, width="stretch", hide_index=True)
-            st.subheader("Fill audit trail")
-            if fills.empty:
-                st.info("No fills recorded yet.")
-            else:
-                st.dataframe(fills, width="stretch", hide_index=True)
-            st.subheader("Rebalance timeline and frozen evidence")
-            if rebalances.empty:
-                st.info("No approvals recorded.")
-            else:
-                st.caption(f"Evidence / run link: Chatgptfolio Lab run #{int(detail['run_id'])}; frozen packet {str(rebalances.iloc[0].get('packet_hash', 'unavailable'))[:16]}…")
-                st.dataframe(rebalances[[column for column in ["rebalance_id", "run_id", "approved_at", "effective_date", "status", "starting_nav", "ending_cash", "model", "packet_hash", "note"] if column in rebalances]], width="stretch", hide_index=True)
-
-    elif active_view == "System Health":
-        st.title("System Health")
-        st.caption("Local-only readiness and data provenance. API secrets are never displayed, logged, or stored in DuckDB.")
-        latest_runs = load_lab_runs(DEFAULT_DB_PATH)
-        latest_error = str(latest_runs.iloc[0]["error_message"]) if not latest_runs.empty and pd.notna(latest_runs.iloc[0].get("error_message")) else None
-        status_one, status_two, status_three = st.columns(3)
-        status_one.metric("OpenAI credential", credential_status(latest_error).title())
-        status_two.metric("Price cache", latest_cache_timestamp(DEFAULT_DB_PATH))
-        status_three.metric("All-seeds readiness", f"{len(all_seed)} unique tickers")
-        st.subheader("Local performance diagnostics")
-        performance = st.session_state.get("performance_diagnostics", {})
-        if performance:
-            st.dataframe(pd.DataFrame(performance.values()), width="stretch", hide_index=True)
-        else:
-            st.info("Open a dashboard view or run a Lab analysis to collect local timing diagnostics for this browser session.")
-        source_health = load_source_health(DEFAULT_DB_PATH)
-        st.subheader("Source health")
-        if source_health.empty:
-            st.info("No research packet has been stored yet. Run a refreshed Lab analysis to establish connector health.")
-        else:
-            st.dataframe(source_health, width="stretch", hide_index=True)
-        st.subheader("Model attempt diagnostics")
-        if latest_runs.empty:
-            st.info("No model attempts have been recorded.")
-        else:
-            st.dataframe(latest_runs, width="stretch", hide_index=True)
-        st.caption("Historical model replay is intentionally unavailable. Only frozen packets with evidence available before the decision date may later be used for replay.")
+            _render_weekly_brief()
 
     elif active_view == "Data Audit":
-        st.subheader("Fetch Log")
-        st.dataframe(load_fetch_log(DEFAULT_DB_PATH), width="stretch", hide_index=True)
-        st.subheader("Signal Table")
-        st.dataframe(signals, width="stretch", hide_index=True)
+        st.subheader("Data Freshness & Coverage")
+        st.caption(DERIVED_200W_NOTE)
+        st.dataframe(data_health, width="stretch", hide_index=True)
+        with st.expander("Raw fetch log"):
+            st.dataframe(fetch_log, width="stretch", hide_index=True)
+        with st.expander("Raw signal table"):
+            st.dataframe(signals, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":

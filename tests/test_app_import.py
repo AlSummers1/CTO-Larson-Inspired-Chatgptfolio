@@ -81,6 +81,110 @@ def test_ranking_column_config_includes_header_help_for_score_columns():
         assert config[column]["help"]
 
 
+def test_regime_history_is_between_theme_and_benchmark_score():
+    app = importlib.import_module("app")
+
+    assert app.RANKING_DISPLAY_COLUMNS.index("theme") + 1 == app.RANKING_DISPLAY_COLUMNS.index(
+        "larsson_regime_history"
+    )
+    assert app.RANKING_DISPLAY_COLUMNS.index("larsson_regime_history") + 1 == app.RANKING_DISPLAY_COLUMNS.index(
+        "benchmark_adjusted_score"
+    )
+
+
+def test_portfolio_allocation_display_adds_regime_history_after_rs_score():
+    app = importlib.import_module("app")
+    target = pd.DataFrame(
+        [
+            {"symbol": "NVDA", "relative_strength_score": 95.0, "larsson_regime": "Bull"},
+            {"symbol": "Cash", "relative_strength_score": 50.0, "larsson_regime": ""},
+        ]
+    )
+    ranked = pd.DataFrame(
+        [{"symbol": "NVDA", "larsson_regime_history": [0.5, 1.0, 1.0]}]
+    )
+
+    display = app.portfolio_allocation_display(target, ranked)
+
+    assert display.columns.tolist() == [
+        "symbol",
+        "relative_strength_score",
+        "larsson_regime_history",
+        "larsson_regime",
+    ]
+    assert display.loc[display["symbol"] == "NVDA", "larsson_regime_history"].iloc[0] == [0.5, 1.0, 1.0]
+    assert display.loc[display["symbol"] == "Cash", "larsson_regime_history"].iloc[0] == []
+
+
+def test_saved_brief_portfolio_chart_and_metrics_highlight_selected_checkpoint():
+    app = importlib.import_module("app")
+    history = app.SavedBriefPortfolioHistory(
+        nav=pd.DataFrame(
+            [
+                {"date": pd.Timestamp("2024-01-02"), "nav": 100_000.0, "cash": 0.0, "drawdown": 0.0},
+                {"date": pd.Timestamp("2024-01-03"), "nav": 105_000.0, "cash": 0.0, "drawdown": 0.0},
+            ]
+        ),
+        benchmarks=pd.DataFrame(
+            [
+                {"date": pd.Timestamp("2024-01-02"), "series": "Brief benchmark", "symbol": "QQQ", "nav": 100_000.0},
+                {"date": pd.Timestamp("2024-01-03"), "series": "Brief benchmark", "symbol": "QQQ", "nav": 102_000.0},
+                {"date": pd.Timestamp("2024-01-02"), "series": "SPY", "symbol": "SPY", "nav": 100_000.0},
+                {"date": pd.Timestamp("2024-01-03"), "series": "SPY", "symbol": "SPY", "nav": 101_000.0},
+            ]
+        ),
+        checkpoints=pd.DataFrame(
+            [
+                {
+                    "saved_brief_id": 7,
+                    "title": "Selected",
+                    "evidence_date": pd.Timestamp("2024-01-01"),
+                    "effective_date": pd.Timestamp("2024-01-02"),
+                    "status": "Applied",
+                }
+            ]
+        ),
+        latest_holdings=pd.DataFrame(),
+        required_symbols=("QQQ", "SPY"),
+        missing_symbols=(),
+        latest_valuation_date=pd.Timestamp("2024-01-03"),
+    )
+
+    metrics = app.saved_brief_tracking_metrics(history)
+    figure = app.saved_brief_portfolio_chart(history, 7)
+
+    assert metrics["current_nav"] == 105_000.0
+    assert metrics["return"] == pytest.approx(0.05)
+    assert metrics["versus_benchmark"] == pytest.approx(0.03)
+    assert [trace.name for trace in figure.data][:3] == ["Saved brief portfolio", "Brief benchmark", "SPY"]
+    selected_trace = next(trace for trace in figure.data if trace.name == "Selected checkpoint")
+    assert selected_trace.marker.size == 13
+
+
+def test_chatgptfolio_commentary_splits_and_formats_observations():
+    app = importlib.import_module("app")
+    text = (
+        "Observation: QQQ remains in a Bull regime. "
+        "Interpretation: The backdrop is constructive. "
+        "Observation: Daily momentum is mixed."
+    )
+
+    points = app.split_commentary_points(text)
+
+    assert points == [
+        "Observation: QQQ remains in a Bull regime.",
+        "Interpretation: The backdrop is constructive.",
+        "Observation: Daily momentum is mixed.",
+    ]
+    assert app.commentary_point_markdown(points[0], "summary") == (
+        "- 🔎 **Observation:** QQQ remains in a Bull regime."
+    )
+    assert app.commentary_point_markdown(points[1], "summary") == (
+        "- 💡 **Interpretation:** The backdrop is constructive."
+    )
+    assert app.commentary_point_markdown("Watch the next close.", "watch_items") == "- 👀 Watch the next close."
+
+
 def test_rrg_control_help_text_is_available():
     app = importlib.import_module("app")
 
@@ -99,7 +203,7 @@ def test_seed_universe_options_default_to_smh():
     assert app.MANUAL_ONLY_UNIVERSE in options
 
 
-def test_seed_rrg_options_exclude_manual_only_and_defaults_are_registered():
+def test_seed_rrg_options_exclude_manual_only_and_all_are_selected_by_default():
     app = importlib.import_module("app")
 
     options = app.seed_rrg_universe_options()
@@ -107,7 +211,7 @@ def test_seed_rrg_options_exclude_manual_only_and_defaults_are_registered():
 
     assert app.MANUAL_ONLY_UNIVERSE not in options
     assert defaults
-    assert set(defaults).issubset(set(options))
+    assert defaults == options
 
 
 def test_select_seed_universe_switches_presets():
@@ -184,17 +288,6 @@ def test_seed_symbol_helpers_use_selected_seed_frames():
     assert symbols == symbol_map["Healthcare Universe"]
 
 
-def test_all_seed_universe_deduplicates_and_preserves_memberships():
-    app = importlib.import_module("app")
-    seed_frames = {
-        "Seed A": pd.DataFrame([{"symbol": "AAA", "name": "A", "theme": "Theme", "fundamental_score": 0, "catalyst_score": 0, "notes": ""}, {"symbol": "B", "name": "B", "theme": "Theme", "fundamental_score": 0, "catalyst_score": 0, "notes": ""}]),
-        "Seed B": pd.DataFrame([{"symbol": "AAA", "name": "A", "theme": "Theme", "fundamental_score": 0, "catalyst_score": 0, "notes": ""}]),
-    }
-    union = app.all_seed_universe(seed_frames)
-    assert union["symbol"].tolist() == ["AAA", "B"]
-    assert union.loc[union["symbol"] == "AAA", "seed_memberships"].iloc[0] == "Seed A · Seed B"
-
-
 def test_rrg_seed_labels_for_fetch_only_when_seed_view_active():
     app = importlib.import_module("app")
 
@@ -213,6 +306,176 @@ def test_portfolio_seed_labels_for_fetch_only_when_enabled():
     assert app.selected_portfolio_seed_labels_for_fetch(selected, False) == []
     assert app.selected_portfolio_seed_labels_for_fetch(selected, True) == ["Healthcare Universe"]
     assert app.selected_portfolio_seed_labels_for_fetch("bad-state", True) == app.default_portfolio_seed_universes()
+
+
+def test_refresh_batch_requires_every_requested_symbol_to_succeed():
+    app = importlib.import_module("app")
+    log = pd.DataFrame(
+        [
+            {"symbol": "AAA", "fetched_at": "2024-01-05 10:00", "status": "ok"},
+            {"symbol": "QQQ", "fetched_at": "2024-01-05 10:00", "status": "ok"},
+        ]
+    )
+
+    assert app.refresh_batch_succeeded(log, ("AAA", "QQQ"))
+    assert not app.refresh_batch_succeeded(log, ("AAA", "BBB", "QQQ"))
+
+
+def test_data_health_overview_is_compact_and_counts_stale_symbols():
+    app = importlib.import_module("app")
+    health = pd.DataFrame(
+        {
+            "reference_market_date": pd.to_datetime(["2024-01-05", "2024-01-05"]),
+            "freshness_status": ["Fresh", "Stale"],
+        }
+    )
+
+    overview = app.data_health_overview(health)
+
+    assert overview == {"market_date": "2024-01-05", "fresh_pct": 50.0, "stale_count": 1}
+
+
+def test_activity_view_is_registered():
+    app = importlib.import_module("app")
+    assert "Activity" in app.VIEW_OPTIONS
+
+
+def test_activity_events_are_grouped_and_filtered_for_change_log():
+    app = importlib.import_module("app")
+    events = pd.DataFrame(
+        [
+            {"effective_market_date": "2024-01-30", "event_type": "larsson_regime_change", "subject": "AAA"},
+            {"effective_market_date": "2024-01-20", "event_type": "stock_rrg_quadrant_change", "subject": "BBB"},
+            {"effective_market_date": "2023-12-01", "event_type": "paper_allocation_added", "subject": "AAA"},
+        ]
+    )
+
+    filtered = app.filter_activity_events(
+        events,
+        categories=["Regime", "RRG"],
+        window_days=30,
+        today=pd.Timestamp("2024-02-01"),
+    )
+
+    assert filtered["subject"].tolist() == ["AAA", "BBB"]
+    assert filtered["event_category"].tolist() == ["Regime", "RRG"]
+    assert app.activity_event_category("paper_allocation_changed") == "Portfolio"
+
+
+def test_report_payload_and_evidence_table_fail_closed():
+    app = importlib.import_module("app")
+
+    assert app.parse_report_payload("not-json") == {}
+    table = app.report_evidence_table(
+        {
+            "effective_market_date": "2024-01-05",
+            "evidence": [
+                {"evidence_id": "SG-1", "kind": "signal_snapshot", "subject": "AAA", "larsson_regime": "Bull"}
+            ],
+        }
+    )
+
+    assert table.to_dict("records") == [
+        {"Evidence ID": "SG-1", "Date": "2024-01-05", "Type": "signal_snapshot", "Subject": "AAA", "Value": "Bull"}
+    ]
+
+
+def test_weekly_report_selection_is_deferred_until_the_next_run():
+    app = importlib.import_module("app")
+    state = {"selected_weekly_report_id": 1}
+
+    app.queue_weekly_report_selection(state, 2)
+
+    assert state["selected_weekly_report_id"] == 1
+    assert state["pending_weekly_report_id"] == 2
+
+    app.apply_pending_weekly_report_selection(state)
+
+    assert state["selected_weekly_report_id"] == 2
+    assert "pending_weekly_report_id" not in state
+
+
+def test_newly_saved_weekly_brief_switches_library_on_next_run():
+    app = importlib.import_module("app")
+    state = {"weekly_brief_library": "Generated"}
+
+    app.queue_saved_weekly_brief_selection(state, 7)
+
+    assert state["weekly_brief_library"] == "Generated"
+    app.apply_pending_saved_weekly_brief_selection(state)
+    assert state["weekly_brief_library"] == "Saved"
+    assert state["selected_saved_weekly_brief_id"] == 7
+
+
+def test_default_saved_brief_title_uses_benchmark_and_evidence_date():
+    app = importlib.import_module("app")
+
+    title = app.default_saved_brief_title(
+        {"benchmark": "QQQ"},
+        {"effective_market_date": "2024-01-05"},
+    )
+
+    assert title == "QQQ Weekly Brief — 2024-01-05"
+
+
+def test_paper_rrg_distribution_chart_uses_rrg_colors_and_hover_details():
+    app = importlib.import_module("app")
+    distribution = pd.DataFrame(
+        [
+            {"quadrant": "Leading", "weight": 0.6, "holding_count": 2, "holdings": "AAA 40.0%, BBB 20.0%"},
+            {"quadrant": "Cash / Unclassified", "weight": 0.4, "holding_count": 1, "holdings": "Cash 40.0%"},
+        ]
+    )
+
+    figure = app.paper_rrg_distribution_chart(distribution)
+
+    assert list(figure.data[0].labels) == ["Leading", "Cash / Unclassified"]
+    assert list(figure.data[0].marker.colors) == [app.RRG_COLORS["Leading"], "#64748b"]
+    assert "Holdings" in figure.data[0].hovertemplate
+
+
+def test_allocation_pie_hides_zero_and_sub_threshold_residuals():
+    app = importlib.import_module("app")
+    portfolio = pd.DataFrame(
+        [
+            {"symbol": "AAA", "seed_universe": "Seed A", "weight": 0.50},
+            {"symbol": "BBB", "seed_universe": "Seed B", "weight": 0.4999999999999998},
+            {"symbol": "Cash", "seed_universe": "Cash", "weight": 2.22e-16},
+            {"symbol": "REMOVED", "seed_universe": "Seed C", "weight": 0.0},
+            {"symbol": "TINY", "seed_universe": "Seed C", "weight": 0.0005},
+        ]
+    )
+
+    grouped = app.visible_allocation_groups(portfolio, "symbol")
+    figure = app.allocation_pie_chart(portfolio, "symbol", "Allocation by Holding")
+
+    assert grouped["symbol"].tolist() == ["AAA", "BBB"]
+    assert list(figure.data[0].labels) == ["AAA", "BBB"]
+    assert list(figure.data[0].values) == pytest.approx([0.50, 0.4999999999999998])
+    assert figure.data[0].texttemplate == "%{percent:.1%}"
+
+
+def test_allocation_pie_keeps_legitimate_minimum_positions():
+    app = importlib.import_module("app")
+    portfolio = pd.DataFrame([{"symbol": "AAA", "weight": 0.02}, {"symbol": "Cash", "weight": 0.98}])
+
+    grouped = app.visible_allocation_groups(portfolio, "symbol")
+
+    assert grouped["symbol"].tolist() == ["AAA", "Cash"]
+
+
+def test_allocation_pie_accepts_taller_activity_layout():
+    app = importlib.import_module("app")
+    portfolio = pd.DataFrame([{"symbol": "AAA", "weight": 1.0}])
+
+    figure = app.allocation_pie_chart(
+        portfolio,
+        "symbol",
+        "Allocation by Holding",
+        height=560,
+    )
+
+    assert figure.layout.height == 560
 
 
 def test_prices_for_symbols_keeps_rankings_scoped_to_active_universe():
@@ -340,29 +603,6 @@ def test_rrg_seed_chart_adds_one_latest_marker_per_seed():
     assert {trace.name for trace in marker_traces} == {"SMH Universe", "Healthcare Universe"}
 
 
-def test_rrg_seed_chart_highlights_selected_seed_and_dims_others():
-    app = importlib.import_module("app")
-    history = pd.DataFrame(
-        [
-            {"seed_name": "SMH Universe", "date": pd.Timestamp("2024-01-05"), "rs_ratio": 99.0, "rs_momentum": 99.0, "quadrant": "Lagging"},
-            {"seed_name": "SMH Universe", "date": pd.Timestamp("2024-01-12"), "rs_ratio": 101.0, "rs_momentum": 101.0, "quadrant": "Leading"},
-            {"seed_name": "Healthcare Universe", "date": pd.Timestamp("2024-01-05"), "rs_ratio": 98.0, "rs_momentum": 102.0, "quadrant": "Improving"},
-            {"seed_name": "Healthcare Universe", "date": pd.Timestamp("2024-01-12"), "rs_ratio": 97.0, "rs_momentum": 101.0, "quadrant": "Improving"},
-        ]
-    )
-    latest = app.latest_seed_rrg(history)
-
-    fig = app.rrg_seed_chart(history, latest, "QQQ", selected_seed="SMH Universe")
-    selected_marker = next(trace for trace in fig.data if trace.name == "SMH Universe")
-    dimmed_marker = next(trace for trace in fig.data if trace.name == "Healthcare Universe")
-    selected_path = next(trace for trace in fig.data if trace.mode == "lines" and trace.line.width == 4)
-    dimmed_path = next(trace for trace in fig.data if trace.mode == "lines" and trace.line.width == 2)
-
-    assert selected_marker.marker.size > dimmed_marker.marker.size
-    assert dimmed_marker.marker.opacity < selected_marker.marker.opacity
-    assert dimmed_path.opacity < selected_path.opacity
-
-
 def test_rrg_chart_highlights_selected_symbol_and_dims_others():
     app = importlib.import_module("app")
     history = pd.DataFrame(
@@ -429,14 +669,6 @@ def test_symbol_from_dataframe_selection_uses_selected_row_position():
     assert app.symbol_from_dataframe_selection({"selection": {"rows": []}}, ranked) is None
 
 
-def test_dashboard_view_after_pending_request_applies_only_valid_request():
-    app = importlib.import_module("app")
-
-    assert app.dashboard_view_after_pending_request("Rankings", "Detail") == "Detail"
-    assert app.dashboard_view_after_pending_request("Detail", "not-a-view") == "Detail"
-    assert app.dashboard_view_after_pending_request("not-a-view", None) == "Rankings"
-
-
 def test_rrg_seed_chart_empty_state_has_no_traces():
     app = importlib.import_module("app")
 
@@ -456,67 +688,53 @@ def test_scaled_basket_overlay_uses_benchmark_start_value():
     assert overlay["value"].tolist() == pytest.approx([200.0, 220.0, 180.0])
 
 
-def test_paper_comparison_normalizes_each_series_and_warns_on_staggered_starts():
+def test_scaled_basket_overlay_rebases_at_first_shared_date():
     app = importlib.import_module("app")
-    nav = pd.DataFrame(
-        {"date": pd.to_datetime(["2026-01-02", "2026-01-03"]), "nav": [98_000.0, 107_800.0]}
-    )
-    normalized = app.normalize_paper_series(nav)
-    experiments = pd.DataFrame(
-        {"fill_date": pd.to_datetime(["2026-01-02", "2026-02-03"])}
-    )
-
-    assert normalized["normalized_nav"].tolist() == pytest.approx([100_000.0, 110_000.0])
-    assert "not directly like-for-like" in app.paper_comparison_start_warning(experiments)
-    assert app.paper_comparison_start_warning(experiments.iloc[:1]) is None
-
-
-def test_shared_paper_market_references_use_the_earliest_fill_and_exclude_technical():
-    app = importlib.import_module("app")
-    experiments = pd.DataFrame(
+    basket_dates = pd.bdate_range("2024-01-01", periods=4)
+    history = pd.DataFrame(
         {
-            "portfolio_id": [24, 23, 26],
-            "fill_date": pd.to_datetime(["2026-07-14", "2026-07-13", None]),
+            "date": basket_dates[2:],
+            "close": [200.0, 210.0],
         }
     )
-    benchmarks = pd.DataFrame(
+    basket = pd.DataFrame(
         {
-            "symbol": ["SPY", "SPY", "QQQ", "QQQ", "TECHNICAL", "TECHNICAL"],
-            "date": pd.to_datetime(["2026-07-13", "2026-07-14"] * 3),
-            "nav": [99_000.0, 108_900.0, 101_000.0, 111_100.0, 100_000.0, 120_000.0],
+            "date": basket_dates,
+            "basket_index": [1.0, 1.1, 1.2, 1.8],
         }
     )
 
-    shared = app.shared_market_benchmark_series(benchmarks)
+    overlay = app.scaled_basket_overlay(history, basket, "close")
 
-    assert app.paper_comparison_benchmark_anchor(experiments) == 23
-    assert list(shared) == ["SPY", "QQQ"]
-    assert all(frame["normalized_nav"].iloc[0] == pytest.approx(100_000.0) for frame in shared.values())
-    assert "TECHNICAL" not in shared
-    assert app.paper_chart_trace_visibility("SPY") == "legendonly"
-    assert app.paper_chart_trace_visibility("BTC-USD") == "legendonly"
-    assert app.paper_chart_trace_visibility("TECHNICAL") is True
+    assert overlay["value"].tolist() == pytest.approx([200.0, 300.0])
 
 
-def test_seed_display_labels_are_compact_and_cash_rule_status_is_explicit():
+def test_scaled_basket_overlay_rejects_invalid_shared_base():
     app = importlib.import_module("app")
+    dates = pd.bdate_range("2024-01-01", periods=2)
+    history = pd.DataFrame({"date": dates, "close": [200.0, 210.0]})
+    basket = pd.DataFrame({"date": dates, "basket_index": [0.0, 1.0]})
 
-    assert app.seed_universe_display_name("Rare Earths and Strategic Materials Universe") == "Rare Earths & Materials"
-    assert app.seed_universe_display_name("Magnificent Seven Universe") == "Mag7"
-    assert app.seed_universe_display_name("Space Exploration Universe") == "Space Exploration"
-    assert app.seed_universe_label_after_migration("Magnificent Seven + SpaceX Universe", app.seed_universe_options()) == "Magnificent Seven Universe"
-    assert app.seed_universe_label_after_migration("removed universe", app.seed_universe_options()) == "SMH Universe"
-    assert app.benchmark_regime_cash_rule_status("Bull", True).endswith("reserve: 0%.")
-    assert app.benchmark_regime_cash_rule_status("Transition", True).endswith("reserve: 15%.")
-    assert app.benchmark_regime_cash_rule_status("Bear", True).endswith("reserve: 35%.")
-    assert "off" in app.benchmark_regime_cash_rule_status("Bear", False)
+    overlay = app.scaled_basket_overlay(history, basket, "close")
+
+    assert overlay.empty
 
 
-def test_paper_experiment_display_name_includes_sensitivity_and_basket():
+def test_scaled_basket_overlay_returns_empty_without_shared_dates():
     app = importlib.import_module("app")
-
-    label = app.paper_experiment_display_name(
-        {"name": "Run 26 — gpt-5.5 — 2026-07-15", "sensitivity": "Balanced", "basket_description": "Long healthcare & chips"}
+    history = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2024-01-01", periods=2),
+            "close": [200.0, 210.0],
+        }
+    )
+    basket = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2024-02-01", periods=2),
+            "basket_index": [1.0, 1.1],
+        }
     )
 
-    assert label == "Run 26 — gpt-5.5 — 2026-07-15 — Balanced — Long healthcare & chips"
+    overlay = app.scaled_basket_overlay(history, basket, "close")
+
+    assert overlay.empty
