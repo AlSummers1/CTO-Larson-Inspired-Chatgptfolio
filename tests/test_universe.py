@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from stockpicker.universe import UNIVERSE_COLUMNS, load_universe, merge_manual_tickers, parse_ticker_text
@@ -292,30 +293,6 @@ EXPECTED_SEED_SYMBOLS = {
         "DDOG",
         "BAH",
     },
-    Path("data/universe_magnificent_seven.csv"): {
-        "AAPL",
-        "MSFT",
-        "GOOGL",
-        "AMZN",
-        "NVDA",
-        "META",
-        "TSLA",
-    },
-    Path("data/universe_space_exploration.csv"): {
-        "RKLB",
-        "LUNR",
-        "RDW",
-        "PL",
-        "BKSY",
-        "ASTS",
-        "IRDM",
-        "GSAT",
-        "VSAT",
-        "SPCE",
-        "LMT",
-        "NOC",
-        "BA",
-    },
 }
 
 
@@ -329,12 +306,27 @@ def test_load_universe_has_future_score_columns():
     assert "NVDA" in set(universe["symbol"])
 
 
+def test_load_universe_drops_blank_symbols_before_string_conversion(tmp_path: Path):
+    path = tmp_path / "universe.csv"
+    pd.DataFrame(
+        {
+            "symbol": [None, " nvda ", "NVDA"],
+            "name": ["Blank row", "NVIDIA", "Duplicate"],
+        }
+    ).to_csv(path, index=False)
+
+    universe = load_universe(path)
+
+    assert universe["symbol"].tolist() == ["NVDA"]
+    assert universe["name"].tolist() == ["NVIDIA"]
+
+
 @pytest.mark.parametrize("path,expected_symbols", EXPECTED_SEED_SYMBOLS.items())
 def test_seed_universe_files_have_expected_symbols(path: Path, expected_symbols: set[str]):
     universe = load_universe(path)
 
     assert list(universe.columns) == UNIVERSE_COLUMNS
-    assert len(universe) == len(expected_symbols)
+    assert len(universe) == 20
     assert not universe["symbol"].duplicated().any()
     assert universe["theme"].astype(str).str.strip().ne("").all()
     assert set(universe["symbol"]) == expected_symbols

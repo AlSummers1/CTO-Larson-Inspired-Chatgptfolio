@@ -1,0 +1,15 @@
+services:
+  dashboard:
+    build:
+      context: .
+    image: chatgptfolio:local
+    ports:
+      - "8501:8501"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+    volumes:
+      - chatgptfolio-state:/app/state
+
+volumes:
+  chatgptfolio-state:

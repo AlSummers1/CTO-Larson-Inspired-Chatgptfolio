@@ -2,32 +2,7 @@
 
 This is a local Streamlit dashboard for ranking technology, AI, semiconductor, cloud, cybersecurity, and infrastructure stocks using transparent technical signals.
 
-It is informational only. It does not place trades, does not connect to a broker, and does not require or store API keys. The first version uses `yfinance` as its only market data source.
-
-## Chatgptfolio Lab
-
-The `Chatgptfolio Lab` dashboard view adds an auditable paper-trading workflow using OpenAI Responses API models. It is an experimental research tool, not investment advice and it never contacts a broker.
-
-- Default decision model: `gpt-5.5`; selectable alternatives: `gpt-5.4`, `gpt-5.4-mini`.
-- Set `OPENAI_API_KEY` in your environment before running a model analysis. On macOS, the app also automatically reads a Keychain entry named `chatgptfolio-openai` for the current user. The application never writes API keys to DuckDB, logs, snapshots, or source control.
-- Alpha Vantage is the primary recent-news source when `ALPHA_VANTAGE_API_KEY` is available in the environment or macOS Keychain entry `chatgptfolio-alpha-vantage`. Each Lab analysis makes one bounded 48-hour multi-ticker request, ranks ticker-linked articles by relevance and sentiment strength, stores only public evidence URLs, and never stores the credential. GDELT supplies fallback discovery only for symbols without fresh Alpha Vantage coverage.
-- Research packets, model configuration, raw structured responses, validation results, evidence, factor scores, and paper orders are persisted locally for audit.
-- The research packet can enrich technical candidates with bounded, timestamped SEC/EDGAR filings and facts, FRED macro observations, and 48-hour ticker news. Missing or failed sources remain explicit; the model is instructed to assess source relevance and abstain rather than fabricate evidence.
-- Model outputs express conviction and underwriting only. A deterministic allocator applies the holding, position, sector, turnover, and cash constraints before any paper order can be approved.
-- Every approved run creates a separate $100,000 paper experiment. Experiments never share capital, positions, fills, NAV, or benchmark history; approvals are not rebalances of any existing experiment.
-- Pending approvals fill independently at the first cached opening price after their frozen research date. The Paper Portfolio view compares normalized experiments, their available SPY/QQQ/GLD/BTC-USD/TECHNICAL baselines, and each experiment's own fill and audit trail.
-
-### Weekly packet CLI
-
-Prepare a reviewable packet from a CSV containing at least `symbol` and `score`:
-
-```bash
-python -m stockpicker.weekly --candidates data/candidates.csv --refresh-research --output /tmp/chatgptfolio-packet.json
-```
-
-To freeze and technically screen the current public S&P 500 constituent master for a research run, use `--sp500-master` instead of `--candidates` (the first run downloads the required local price cache).
-
-The command never submits broker orders. Set `CHATGPTFOLIO_USER_AGENT` to a contact-bearing value before using SEC sources at scale.
+It is informational only. It does not place trades or connect to a broker. Market analysis is local and needs no API key. Optional weekly-report commentary reads `OPENAI_API_KEY` from the process environment or, on macOS, the current user's `chatgptfolio-openai` Keychain item. It never accepts or stores the key in the UI or DuckDB.
 
 ## Install
 
@@ -43,6 +18,36 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Run With Docker
+
+Build and start the dashboard with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:8501`. A named volume keeps the DuckDB cache and report history outside the container, so rebuilding the image does not erase local state.
+
+Optional AI commentary uses the same environment variables as the local Python setup:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="gpt-5.6-terra"  # optional
+docker compose up --build
+```
+
+The image runs as an unprivileged user and exposes a Streamlit health check. The database location can be changed with `CHATGPTFOLIO_DB_PATH`; the container defaults to `/app/state/market_data.duckdb`.
+
+### GitHub Container Registry
+
+The `Container` GitHub Actions workflow builds the image for pushes to `main` and pull requests without publishing it. Run the workflow manually from GitHub Actions when you are ready to publish `latest` and commit-SHA tags to:
+
+```text
+ghcr.io/<owner>/<repository>
+```
+
+The workflow uses GitHub's repository-scoped `GITHUB_TOKEN`; no registry password needs to be added. GitHub packages are private when first published unless their visibility is changed in the package settings.
+
 ## Test
 
 ```bash
@@ -54,6 +59,9 @@ python -m compileall .
 
 - `app.py`: Streamlit dashboard.
 - `stockpicker/data.py`: yfinance downloader plus DuckDB cache.
+- `stockpicker/data_quality.py`: benchmark-calendar freshness, coverage, fetch status, and unchanged-close checks.
+- `stockpicker/activity.py`: comparable analysis snapshots and idempotent change events.
+- `stockpicker/reports.py`: deterministic Markdown reports and optional evidence-linked OpenAI commentary.
 - `stockpicker/signals.py`: trend, moving-average, drawdown, extension, and Larsson-proxy calculations.
 - `stockpicker/scoring.py`: 0-100 ranking model.
 - `stockpicker/universe.py`: seed CSV loading and manual ticker parsing.
@@ -74,10 +82,15 @@ Rows are cached locally in:
 data/market_data.duckdb
 ```
 
-The cache has two tables:
+The cache keeps its original tables and upgrades additively:
 
 - `prices`: adjusted daily OHLCV by `symbol` and `date`.
 - `fetch_log`: fetch time, row counts, success/failure status, and messages.
+- `analysis_runs` and `signal_snapshots`: explicit successful-refresh baselines.
+- `signal_events`: normalized, idempotent signal, freshness, RRG, and paper-allocation changes.
+- `portfolio_snapshots`, `portfolio_holdings`, and `portfolio_rebalance_log`: saved paper-allocation state.
+- `weekly_reports`: deterministic report history plus structured AI commentary and generation metadata when requested.
+- `saved_weekly_briefs`: named, immutable presentation snapshots of selected weekly reports.
 
 Use the dashboard's refresh button to redownload the active universe and benchmark.
 
@@ -102,8 +115,6 @@ Built-in presets:
 - `Crypto Universe`: public crypto and blockchain equities, not crypto assets like `BTC-USD`.
 - `Quantum Universe`: quantum pure plays, quantum security, quantum platforms, and enabling semiconductor/software suppliers.
 - `Cybersecurity Universe`: security platforms, endpoint, identity, zero trust, vulnerability management, data resilience, and cyber services.
-- `Magnificent Seven Universe`: Apple, Microsoft, Alphabet, Amazon, NVIDIA, Meta, and Tesla.
-- `Space Exploration Universe`: listed launch, lunar-services, space-infrastructure, Earth-observation, satellite-communications, and mission-systems companies. SpaceX is not included because it is private.
 
 The ticker text area is prefilled from the selected preset and is the active watchlist. Removing a ticker removes it from the current run; adding an unknown ticker marks it as `Manual` while preserving seed metadata for preset tickers.
 
@@ -124,8 +135,10 @@ This dashboard uses an inspectable Larsson Line proxy. It is not an official CTO
 For each stock and the benchmark:
 
 ```text
-larsson_line_proxy = max(SMA_200D, forward_filled_SMA_200W)
+larsson_line_proxy = max(SMA_200D, derived_daily_view_of_SMA_200W)
 ```
+
+Raw daily prices are never forward-filled. The 200W component is a derived weekly indicator carried between weekly observations and is labeled that way in the UI.
 
 Regime states:
 
@@ -313,13 +326,39 @@ The tab shows:
 - suppressed changes
 - seed-level RRG strategy signals
 - candidate pool audit
-- an LLM prompt preview
+- a collapsed deterministic allocator evidence preview
 
 Portfolio seed-universe price data is loaded on demand from the `Portfolio` tab. This keeps normal dashboard startup focused on the active rankings universe and benchmark.
 
-The LLM prompt is generated locally for review or future integration. The app does not call any LLM API and does not require API keys.
+Portfolio snapshots are saved locally in DuckDB when `Save current allocation as baseline` is clicked. Baselines are matched by benchmark, selected seed universes, sensitivity, and allocator config hash before they are used for change tracking. Accepted changes are logged as **paper allocation changes**, never fills or executions.
 
-Portfolio snapshots are saved locally in DuckDB when `Save current allocation as baseline` is clicked. Baselines are matched by benchmark, selected seed universes, sensitivity, and allocator config hash before they are used for change tracking. The saved baseline is used to track added, removed, increased, reduced, and suppressed model-allocation changes.
+## Trust, Activity, And Weekly Reports
+
+The compact overview shows the selected benchmark and regime, reference market-data date, fresh-symbol coverage, stale count, and changes since the prior comparable snapshot.
+
+Data health uses the selected benchmark's observed dates as the trading-session calendar, so weekends and benchmark holidays do not count as missing sessions. Zero sessions behind is `Fresh`, one is `Delayed`, and two or more is `Stale`. If benchmark dates are unavailable, the latest broadly observed date is used and coverage is marked approximate. These states are interpretation warnings and do not exclude rankings.
+
+Only an explicit, fully successful `Refresh cache` action captures an analysis snapshot. The first matching snapshot is a baseline. Later snapshots compare only when benchmark, active-universe hash, and canonical signal configuration match. Logged RRG changes always use the stable 10/10-week defaults, independent of exploratory sliders.
+
+The `Activity` view has two focused modes. `Weekly Brief` turns a selected report into a compact decision layer with market stance, data confidence, material changes, leaders, risks, paper-portfolio impact, and a short Chatgptfolio interpretation. Generated reports remain the deterministic audit history; the `Save brief` action creates a named, immutable snapshot that can be loaded later from the `Saved` library without changing when its source commentary is regenerated. A portfolio-weighted RRG distribution chart uses only the paper-allocation evidence captured with that report, including Cash or unclassified holdings as a separate slice. Saved briefs also form one continuous, hypothetical $100,000 paper history: the latest brief for each evidence date rebalances at the next eligible cached open, while the chart compares the evolving portfolio with its active brief benchmark and SPY. Tracker prices refresh only on explicit request, valuation is recomputed from the local adjusted-price cache, and no broker is contacted. `Change Log` presents the chronological audit trail with grouped filters and summary counts. Full deterministic Markdown, downloads, and evidence ledgers remain available in collapsed audit sections. Reports create a new version only when their compact evidence payload changes.
+
+Optional AI commentary is generated only after clicking `Generate AI Commentary`:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="gpt-5.6-terra"  # optional override
+streamlit run app.py
+```
+
+For a local macOS setup, the key can instead remain in Keychain:
+
+```bash
+security add-generic-password -U -a "$USER" -s chatgptfolio-openai -w
+```
+
+The command prompts for the key without placing it in the dashboard or database. Environment configuration takes priority when both sources are present. Docker uses the environment variable because it cannot access the host macOS Keychain.
+
+The Responses API request uses `store=False` and sends only the compact evidence payload. Returned sections must cite known evidence IDs before they render. Final commentary is retained locally in both structured and Markdown form alongside its model, generation time, prompt hash, status, and usage metadata. Legacy Markdown-only commentary remains readable. Missing credentials, timeouts, refusals, schema failures, and API errors leave the deterministic report usable.
 
 ## Benchmark Seed Overlay
 
@@ -332,18 +371,19 @@ This overlay is visual context only. It does not change scores, rankings, RRG, b
 ## Dashboard Tabs
 
 - `Rankings`: ranked table with current regime, regime-history histogram, trend states, filters, drawdown, extension, and data warnings.
-- `Detail`: selected ticker charts for daily trend, weekly trend, and drawdown.
+- `Detail`: selected ticker charts, freshness status, read-only seed notes, and recent signal timeline.
 - `Benchmark`: selected benchmark metrics, regime history, price trend, weekly trend, and drawdown.
 - `RRG`: relative rotation view filtered by built-in seed themes.
-- `Portfolio`: model portfolio allocation, sensitivity controls, change tracking, and LLM prompt preview.
-- `Data Audit`: fetch log and raw signal table for inspection.
+- `Portfolio`: model portfolio allocation, sensitivity controls, and paper-allocation change tracking.
+- `Activity`: generated and named immutable weekly briefs, portfolio RRG exposure, a filtered change timeline, optional AI commentary, evidence, and Markdown download.
+- `Data Audit`: freshness/coverage table with collapsed raw fetch log and raw signal table.
 
 Table headers in the rankings, RRG, and portfolio tables include hover explanations for the score, trend, relative-strength, filter, drawdown, extension, allocation, and warning columns.
 
 ## Constraints
 
 - No brokerage execution.
-- No API keys.
+- No API keys in the UI or database; optional OpenAI commentary uses an environment variable.
 - No hidden paid data.
 - Simple, readable Python is preferred over complex abstractions.
 - All scoring math is local and inspectable.

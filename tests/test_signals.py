@@ -116,6 +116,37 @@ def test_equal_weight_basket_history_skips_missing_symbols():
     assert basket["basket_index"].tolist() == pytest.approx([1.0, 1.1, 1.2])
 
 
+def test_equal_weight_basket_deduplicates_and_excludes_benchmark():
+    stock = make_prices_from_closes("AAA", [100.0, 110.0, 120.0])
+    benchmark = make_prices_from_closes("QQQ", [200.0, 210.0, 220.0])
+
+    basket, used, missing = equal_weight_basket_history(
+        pd.concat([stock, benchmark], ignore_index=True),
+        ["AAA", "AAA", "QQQ", "MISSING", "MISSING"],
+        "QQQ",
+    )
+
+    assert used == ["AAA"]
+    assert missing == ["MISSING"]
+    assert basket["basket_index"].tolist() == pytest.approx([1.0, 1.1, 1.2])
+
+
+def test_equal_weight_basket_rebases_at_common_history_start():
+    older_stock = make_prices_from_closes("AAA", [100.0, 110.0, 120.0, 130.0])
+    newer_stock = make_prices_from_closes("BBB", [50.0, 55.0], start="2022-01-05")
+
+    basket, used, missing = equal_weight_basket_history(
+        pd.concat([older_stock, newer_stock], ignore_index=True),
+        ["AAA", "BBB"],
+        "QQQ",
+    )
+
+    assert used == ["AAA", "BBB"]
+    assert missing == []
+    assert basket["date"].tolist() == newer_stock["date"].tolist()
+    assert basket["basket_index"].tolist() == pytest.approx([1.0, (130 / 120 + 55 / 50) / 2])
+
+
 def test_equal_weight_basket_drawdown_uses_basket_index():
     stock_a = make_prices_from_closes("AAA", [100.0, 200.0, 100.0])
     stock_b = make_prices_from_closes("BBB", [100.0, 100.0, 100.0])

@@ -3,32 +3,165 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import stockpicker.data as data_module
+
 from stockpicker.data import (
-    approve_paper_rebalance,
-    default_paper_portfolio,
-    execute_pending_paper_rebalances,
+    PRICE_COLUMNS,
+    download_prices,
+    fetch_price_history,
     init_database,
-    load_paper_nav,
-    load_paper_benchmarks,
-    load_paper_experiments,
-    load_paper_fills,
-    load_paper_positions,
-    load_paper_rebalances,
-    migrate_legacy_pending_paper_rebalances,
-    rebuild_paper_nav,
-    paper_valuation_symbols,
+    load_fetch_log,
     load_latest_portfolio_snapshot,
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
     read_cached_prices,
     save_portfolio_snapshot,
-    save_lab_run,
-    save_lab_research_snapshot,
     write_prices,
 )
 
 
 pytest.importorskip("duckdb")
+
+
+def downloaded_frame(column_order: str) -> pd.DataFrame:
+    dates = pd.bdate_range("2024-01-01", periods=2, tz="UTC")
+    values = {
+        "AAA": {
+            "Open": [10.0, 11.0],
+            "High": [10.5, 11.5],
+            "Low": [9.5, 10.5],
+            "Close": [10.25, 11.25],
+            "Volume": [1_000, 1_100],
+        },
+        "BBB": {
+            "Open": [20.0, 21.0],
+            "High": [20.5, 21.5],
+            "Low": [19.5, 20.5],
+            "Close": [20.25, 21.25],
+            "Volume": [2_000, 2_100],
+        },
+    }
+    columns = {}
+    for symbol, fields in values.items():
+        for field, field_values in fields.items():
+            key = (symbol, field) if column_order == "ticker_first" else (field, symbol)
+            columns[key] = field_values
+    frame = pd.DataFrame(columns, index=dates)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+    return frame
+
+
+@pytest.mark.parametrize("column_order", ["ticker_first", "field_first"])
+def test_download_prices_supports_yfinance_multiindex_orientations(monkeypatch, column_order: str):
+    raw = downloaded_frame(column_order)
+    calls = []
+
+    class FakeYFinance:
+        @staticmethod
+        def download(**kwargs):
+            calls.append(kwargs)
+            return raw
+
+    monkeypatch.setattr(data_module, "_import_yfinance", lambda: FakeYFinance())
+
+    prices = download_prices(["bbb", "AAA"], years=5)
+
+    assert calls[0]["tickers"] == "BBB AAA"
+    assert calls[0]["period"] == "5y"
+    assert prices.groupby("symbol")["close"].apply(list).to_dict() == {
+        "AAA": [10.25, 11.25],
+        "BBB": [20.25, 21.25],
+    }
+    assert prices["date"].dt.tz is None
+
+
+def test_download_prices_skips_symbol_without_close(monkeypatch):
+    raw = pd.DataFrame(
+        {"Open": [10.0], "Volume": [1_000]},
+        index=pd.bdate_range("2024-01-01", periods=1),
+    )
+
+    class FakeYFinance:
+        @staticmethod
+        def download(**_kwargs):
+            return raw
+
+    monkeypatch.setattr(data_module, "_import_yfinance", lambda: FakeYFinance())
+
+    prices = download_prices(["AAA"])
+
+    assert prices.empty
+    assert prices.columns.tolist() == PRICE_COLUMNS
+
+
+def test_fetch_price_history_downloads_only_cache_misses(monkeypatch, tmp_path: Path):
+    db_path = tmp_path / "market_data.duckdb"
+    cached = pd.DataFrame(
+        {
+            "symbol": ["AAA"],
+            "date": pd.to_datetime(["2024-01-02"]),
+            "open": [10.0],
+            "high": [10.5],
+            "low": [9.5],
+            "close": [10.25],
+            "volume": [1_000],
+        }
+    )
+    downloaded = cached.assign(
+        symbol="BBB",
+        open=20.0,
+        high=20.5,
+        low=19.5,
+        close=20.25,
+        volume=2_000,
+    )
+    write_prices(cached, db_path)
+    calls = []
+
+    def fake_download(symbols, years=10):
+        calls.append((symbols, years))
+        return downloaded
+
+    monkeypatch.setattr(data_module, "download_prices", fake_download)
+
+    prices = fetch_price_history(["aaa", "BBB"], years=7, db_path=db_path)
+    log = load_fetch_log(db_path)
+
+    assert calls == [(["BBB"], 7)]
+    assert prices["symbol"].tolist() == ["AAA", "BBB"]
+    assert log[["symbol", "status", "rows"]].to_dict("records") == [
+        {"symbol": "BBB", "status": "ok", "rows": 1}
+    ]
+
+
+def test_failed_refresh_preserves_cache_and_records_failure(monkeypatch, tmp_path: Path):
+    db_path = tmp_path / "market_data.duckdb"
+    cached = pd.DataFrame(
+        {
+            "symbol": ["AAA"],
+            "date": pd.to_datetime(["2024-01-02"]),
+            "open": [10.0],
+            "high": [10.5],
+            "low": [9.5],
+            "close": [10.25],
+            "volume": [1_000],
+        }
+    )
+    write_prices(cached, db_path)
+    monkeypatch.setattr(
+        data_module,
+        "download_prices",
+        lambda _symbols, years=10: pd.DataFrame(columns=PRICE_COLUMNS),
+    )
+
+    prices = fetch_price_history(["AAA"], refresh=True, db_path=db_path)
+    log = load_fetch_log(db_path)
+
+    assert prices["close"].tolist() == [10.25]
+    assert log.loc[0, "symbol"] == "AAA"
+    assert log.loc[0, "status"] == "failed"
+    assert log.loc[0, "rows"] == 0
+    assert "No rows returned" in log.loc[0, "message"]
 
 
 def test_duckdb_cache_round_trip(tmp_path: Path):
@@ -50,199 +183,11 @@ def test_duckdb_cache_round_trip(tmp_path: Path):
     assert cached["close"].tolist() == [10.0, 11.0]
 
 
-def test_approved_paper_rebalance_fills_next_open_and_builds_nav(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    packet_hash = save_lab_research_snapshot(
-        {"as_of_date": "2026-01-02", "candidates": [{"symbol": "NVDA", "score": 99.0}]}, db_path
-    )
-    run_id = save_lab_run(
-        {"as_of_date": "2026-01-02", "benchmark": "SPY", "model": "gpt-5.5", "status": "proposal_ready", "packet_hash": packet_hash}, db_path
-    )
-    legacy_portfolio_id = default_paper_portfolio(1_000.0, db_path)
-    rebalance_id = approve_paper_rebalance(
-        run_id,
-        {"holdings": [{"symbol": "NVDA", "weight": 0.8}], "cash_weight": 0.2},
-        {"paper_capital": 1_000.0, "slippage_bps": 0.0, "commission_bps": 0.0},
-        pd.Timestamp("2026-01-02").date(),
-        legacy_portfolio_id,
-        db_path,
-    )
-    experiments = load_paper_experiments(db_path)
-    assert len(experiments) == 1
-    portfolio_id = int(experiments.iloc[0]["portfolio_id"])
-    assert portfolio_id != legacy_portfolio_id
-    assert experiments.iloc[0]["run_id"] == run_id
-    assert experiments.iloc[0]["initial_capital"] == pytest.approx(100_000.0)
-    prices = pd.DataFrame(
-        {
-            "symbol": ["NVDA", "NVDA", "SPY", "SPY"],
-            "date": pd.to_datetime(["2026-01-02", "2026-01-03", "2026-01-02", "2026-01-03"]),
-            "open": [10.0, 10.0, 100.0, 100.0],
-            "high": [10.0, 11.0, 100.0, 101.0],
-            "low": [10.0, 10.0, 100.0, 100.0],
-            "close": [10.0, 11.0, 100.0, 101.0],
-            "volume": [1_000_000] * 4,
-        }
-    )
-    assert execute_pending_paper_rebalances(prices, db_path) == [rebalance_id]
-    positions = load_paper_positions(portfolio_id, db_path)
-    assert positions["symbol"].tolist() == ["NVDA"]
-    assert positions["shares"].iloc[0] == pytest.approx(8_000.0)
-    rebuild_paper_nav(prices, portfolio_id, db_path)
-    nav = load_paper_nav(portfolio_id, db_path)
-    assert nav["nav"].iloc[-1] == pytest.approx(108_000.0)
-    assert "TECHNICAL" in load_paper_benchmarks(portfolio_id, db_path)["symbol"].tolist()
-    valuation_symbols = paper_valuation_symbols(portfolio_id, db_path)
-    assert {"NVDA", "SPY", "QQQ", "GLD", "BTC-USD"}.issubset(valuation_symbols)
-    import duckdb
-    with duckdb.connect(str(db_path), read_only=True) as conn:
-        first_rebuilt_at = conn.execute("SELECT rebuilt_at FROM lab_paper_valuation_state WHERE portfolio_id = ?", [portfolio_id]).fetchone()[0]
-    rebuild_paper_nav(prices, portfolio_id, db_path)
-    with duckdb.connect(str(db_path), read_only=True) as conn:
-        second_rebuilt_at = conn.execute("SELECT rebuilt_at FROM lab_paper_valuation_state WHERE portfolio_id = ?", [portfolio_id]).fetchone()[0]
-    assert second_rebuilt_at == first_rebuilt_at
+def test_database_path_can_be_redirected_for_container_storage(monkeypatch, tmp_path: Path):
+    container_path = tmp_path / "state" / "market_data.duckdb"
+    monkeypatch.setenv("CHATGPTFOLIO_DB_PATH", str(container_path))
 
-
-def test_unapproved_run_cannot_change_paper_positions(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    default_paper_portfolio(1_000.0, db_path)
-    prices = pd.DataFrame(columns=["symbol", "date", "open", "high", "low", "close", "volume"])
-    assert execute_pending_paper_rebalances(prices, db_path) == []
-    assert load_paper_positions(db_path=db_path).empty
-
-
-def _proposal_run(db_path: Path, symbol: str, as_of_date: str = "2026-01-02") -> int:
-    packet_hash = save_lab_research_snapshot(
-        {"as_of_date": as_of_date, "candidates": [{"symbol": symbol, "score": 99.0}]}, db_path
-    )
-    return save_lab_run(
-        {"as_of_date": as_of_date, "benchmark": "SPY", "model": "gpt-5.5", "status": "proposal_ready", "packet_hash": packet_hash},
-        db_path,
-    )
-
-
-def test_each_approval_creates_an_isolated_100k_experiment(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    legacy_portfolio_id = default_paper_portfolio(1_000.0, db_path)
-    first_run, second_run = _proposal_run(db_path, "AAA"), _proposal_run(db_path, "BBB")
-    first_rebalance = approve_paper_rebalance(first_run, {"holdings": [{"symbol": "AAA", "weight": 0.8}], "cash_weight": 0.2}, {"slippage_bps": 0.0, "commission_bps": 0.0}, pd.Timestamp("2026-01-02").date(), legacy_portfolio_id, db_path)
-    second_rebalance = approve_paper_rebalance(second_run, {"holdings": [{"symbol": "BBB", "weight": 0.6}], "cash_weight": 0.4}, {"slippage_bps": 0.0, "commission_bps": 0.0}, pd.Timestamp("2026-01-02").date(), legacy_portfolio_id, db_path)
-
-    experiments = load_paper_experiments(db_path).sort_values("run_id")
-    assert experiments["run_id"].tolist() == [first_run, second_run]
-    assert experiments["initial_capital"].tolist() == pytest.approx([100_000.0, 100_000.0])
-    assert experiments["portfolio_id"].nunique() == 2
-    assert legacy_portfolio_id not in experiments["portfolio_id"].tolist()
-    first_portfolio, second_portfolio = experiments["portfolio_id"].astype(int).tolist()
-    assert load_paper_rebalances(first_portfolio, db_path)["rebalance_id"].tolist() == [first_rebalance]
-    assert load_paper_rebalances(second_portfolio, db_path)["rebalance_id"].tolist() == [second_rebalance]
-
-
-def test_paper_experiment_includes_frozen_sensitivity_and_basket_summary(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    run_id = _proposal_run(db_path, "NVDA")
-    approve_paper_rebalance(
-        run_id,
-        {
-            "holdings": [
-                {"symbol": "NVDA", "weight": 0.60, "sector": "SMH Universe"},
-                {"symbol": "LLY", "weight": 0.40, "sector": "Healthcare Universe"},
-            ],
-            "cash_weight": 0.0,
-        },
-        {"max_turnover": 0.60, "slippage_bps": 0.0, "commission_bps": 0.0},
-        pd.Timestamp("2026-01-02").date(),
-        db_path=db_path,
-    )
-
-    experiment = load_paper_experiments(db_path).iloc[0]
-
-    assert experiment["sensitivity"] == "Aggressive"
-    assert experiment["basket_description"] == "Long chips & healthcare"
-
-
-def test_legacy_pending_runs_23_and_24_migrate_idempotently_before_the_next_open(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    legacy_portfolio_id = default_paper_portfolio(db_path=db_path)
-    import duckdb
-
-    frozen_decisions = {
-        23: '{"holdings": [{"symbol": "AAA", "weight": 0.8}], "cash_weight": 0.2}',
-        24: '{"holdings": [{"symbol": "BBB", "weight": 0.6}], "cash_weight": 0.4}',
-    }
-    with duckdb.connect(str(db_path)) as conn:
-        for run_id in [23, 24]:
-            conn.execute(
-                """INSERT INTO lab_runs (run_id, created_at, as_of_date, benchmark, model, status)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                [run_id, pd.Timestamp("2026-07-13 10:00"), pd.Timestamp("2026-07-13").date(), "SPY", f"model-{run_id}", "proposal_ready"],
-            )
-            conn.execute(
-                """INSERT INTO lab_paper_rebalances
-                   (portfolio_id, run_id, approved_at, status, config_json, decision_json, note)
-                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
-                [legacy_portfolio_id, run_id, pd.Timestamp("2026-07-13 11:00"), '{"slippage_bps": 5}', frozen_decisions[run_id], "Awaiting next open after 2026-07-13"],
-            )
-
-    migrated = migrate_legacy_pending_paper_rebalances(db_path)
-    assert len(migrated) == 2
-    assert migrate_legacy_pending_paper_rebalances(db_path) == []
-    experiments = load_paper_experiments(db_path).sort_values("run_id")
-    assert experiments["run_id"].tolist() == [23, 24]
-    assert experiments["has_pending"].tolist() == [True, True]
-    assert all(name.startswith("Run ") and "model-" in name for name in experiments["name"])
-    assert load_paper_rebalances(legacy_portfolio_id, db_path).empty
-    for _, experiment in experiments.iterrows():
-        rebalance = load_paper_rebalances(int(experiment["portfolio_id"]), db_path).iloc[0]
-        assert rebalance["status"] == "pending"
-        assert rebalance["decision_json"] == frozen_decisions[int(experiment["run_id"])]
-    no_next_open = pd.DataFrame({"symbol": ["AAA", "BBB"], "date": pd.to_datetime(["2026-07-13", "2026-07-13"]), "open": [10.0, 20.0], "high": [10.0, 20.0], "low": [10.0, 20.0], "close": [10.0, 20.0], "volume": [1_000_000, 1_000_000]})
-    assert execute_pending_paper_rebalances(no_next_open, db_path) == []
-
-
-def test_pending_experiments_fill_and_value_independently(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    first_run, second_run = _proposal_run(db_path, "AAA"), _proposal_run(db_path, "BBB")
-    first_rebalance = approve_paper_rebalance(first_run, {"holdings": [{"symbol": "AAA", "weight": 0.8}], "cash_weight": 0.2}, {"slippage_bps": 0.0, "commission_bps": 0.0}, pd.Timestamp("2026-01-02").date(), db_path=db_path)
-    second_rebalance = approve_paper_rebalance(second_run, {"holdings": [{"symbol": "BBB", "weight": 0.7}], "cash_weight": 0.3}, {"slippage_bps": 0.0, "commission_bps": 0.0}, pd.Timestamp("2026-01-02").date(), db_path=db_path)
-    prices = pd.DataFrame({
-        "symbol": ["AAA", "BBB", "SPY", "QQQ", "GLD", "BTC-USD"] * 2,
-        "date": pd.to_datetime(["2026-01-02"] * 6 + ["2026-01-03"] * 6),
-        "open": [10.0, 20.0, 100.0, 200.0, 50.0, 40_000.0] * 2,
-        "high": [11.0, 22.0, 101.0, 202.0, 51.0, 40_100.0] * 2,
-        "low": [10.0, 20.0, 99.0, 198.0, 49.0, 39_900.0] * 2,
-        "close": [10.0, 20.0, 100.0, 200.0, 50.0, 40_000.0, 11.0, 22.0, 101.0, 202.0, 51.0, 40_100.0],
-        "volume": [1_000_000] * 12,
-    })
-    assert execute_pending_paper_rebalances(prices, db_path) == [first_rebalance, second_rebalance]
-    experiments = load_paper_experiments(db_path).sort_values("run_id")
-    first_portfolio, second_portfolio = experiments["portfolio_id"].astype(int).tolist()
-    assert load_paper_positions(first_portfolio, db_path)["symbol"].tolist() == ["AAA"]
-    assert load_paper_positions(second_portfolio, db_path)["symbol"].tolist() == ["BBB"]
-    for portfolio_id in [first_portfolio, second_portfolio]:
-        rebuild_paper_nav(prices, portfolio_id, db_path)
-        assert not load_paper_nav(portfolio_id, db_path).empty
-        assert {"SPY", "QQQ", "GLD", "BTC-USD"}.issubset(load_paper_benchmarks(portfolio_id, db_path)["symbol"])
-    assert {"AAA", "BBB", "SPY", "QQQ", "GLD", "BTC-USD"}.issubset(paper_valuation_symbols(db_path=db_path))
-
-
-def test_new_approval_cannot_change_a_filled_experiment(tmp_path: Path):
-    db_path = tmp_path / "market_data.duckdb"
-    first_run = _proposal_run(db_path, "AAA")
-    approve_paper_rebalance(first_run, {"holdings": [{"symbol": "AAA", "weight": 1.0}], "cash_weight": 0.0}, {"slippage_bps": 0.0, "commission_bps": 0.0}, pd.Timestamp("2026-01-02").date(), db_path=db_path)
-    prices = pd.DataFrame({"symbol": ["AAA", "AAA", "BBB", "BBB"], "date": pd.to_datetime(["2026-01-02", "2026-01-03", "2026-01-02", "2026-01-03"]), "open": [10.0, 10.0, 20.0, 20.0], "high": [10.0, 11.0, 20.0, 21.0], "low": [10.0, 10.0, 20.0, 20.0], "close": [10.0, 11.0, 20.0, 21.0], "volume": [1_000_000] * 4})
-    execute_pending_paper_rebalances(prices, db_path)
-    first_portfolio = int(load_paper_experiments(db_path).iloc[0]["portfolio_id"])
-    before = load_paper_positions(first_portfolio, db_path).copy()
-    rebuild_paper_nav(prices, first_portfolio, db_path)
-    nav_before = load_paper_nav(first_portfolio, db_path).copy()
-    fills_before = load_paper_fills(first_portfolio, db_path).copy()
-    second_run = _proposal_run(db_path, "BBB")
-    approve_paper_rebalance(second_run, {"holdings": [{"symbol": "BBB", "weight": 1.0}], "cash_weight": 0.0}, {"slippage_bps": 0.0, "commission_bps": 0.0}, pd.Timestamp("2026-01-02").date(), first_portfolio, db_path)
-    execute_pending_paper_rebalances(prices, db_path)
-    pd.testing.assert_frame_equal(before, load_paper_positions(first_portfolio, db_path))
-    pd.testing.assert_frame_equal(fills_before, load_paper_fills(first_portfolio, db_path))
-    pd.testing.assert_frame_equal(nav_before, rebuild_paper_nav(prices, first_portfolio, db_path))
+    assert data_module.configured_db_path() == container_path
 
 
 def test_portfolio_snapshot_round_trip(tmp_path: Path):
@@ -421,3 +366,30 @@ def test_portfolio_snapshot_insert_uses_column_names_for_existing_schema(tmp_pat
 
     assert loaded["reason_codes"].tolist() == ["score_improved, rrg_seed_improving"]
     assert loaded["data_warnings"].tolist() == [""]
+
+
+def test_existing_database_upgrades_additively_and_idempotently(tmp_path: Path):
+    db_path = tmp_path / "legacy.duckdb"
+    import duckdb
+
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE prices (
+                symbol VARCHAR, date DATE, open DOUBLE, high DOUBLE,
+                low DOUBLE, close DOUBLE, volume DOUBLE,
+                PRIMARY KEY (symbol, date)
+            )
+            """
+        )
+        conn.execute("INSERT INTO prices VALUES ('AAA', '2024-01-05', 1, 1, 1, 1, 100)")
+
+    init_database(db_path)
+    init_database(db_path)
+
+    with duckdb.connect(str(db_path)) as conn:
+        tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+        preserved = conn.execute("SELECT symbol, close FROM prices").fetchall()
+
+    assert {"analysis_runs", "signal_snapshots", "signal_events", "weekly_reports", "saved_weekly_briefs"}.issubset(tables)
+    assert preserved == [("AAA", 1.0)]

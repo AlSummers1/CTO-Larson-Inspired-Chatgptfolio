@@ -1,7 +1,7 @@
-pandas
-yfinance
-duckdb
-streamlit
-plotly
-pytest
-openai
+pandas==2.3.3
+yfinance==1.2.0
+duckdb==1.4.5
+streamlit==1.50.0
+plotly==6.9.0
+openai==2.45.0
+pytest==8.4.2

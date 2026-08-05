@@ -35,6 +35,7 @@ def load_universe(path: Path) -> pd.DataFrame:
             frame[column] = 0 if column.endswith("_score") else ""
 
     frame = frame[UNIVERSE_COLUMNS].copy()
+    frame = frame[frame["symbol"].notna()].copy()
     frame["symbol"] = frame["symbol"].astype(str).map(normalize_symbol)
     frame = frame[frame["symbol"] != ""]
     frame["fundamental_score"] = pd.to_numeric(frame["fundamental_score"], errors="coerce").fillna(0.0)

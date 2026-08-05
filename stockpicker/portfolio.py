@@ -201,7 +201,8 @@ def _candidate_reason_codes(row: pd.Series) -> str:
     rrg_reason = str(row.get("rrg_reason", ""))
     if rrg_reason:
         reasons.append(rrg_reason)
-    if row.get("pass_200w") is False:
+    pass_200w = row.get("pass_200w")
+    if pass_200w is not None and not pd.isna(pass_200w) and not bool(pass_200w):
         reasons.append("failed_200w")
     drawdown = pd.to_numeric(pd.Series([row.get("drawdown_52w")]), errors="coerce").iloc[0]
     if not pd.isna(drawdown) and drawdown <= -0.35:

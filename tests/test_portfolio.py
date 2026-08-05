@@ -140,6 +140,32 @@ def test_candidate_selection_excludes_weak_and_failed_200d_by_default():
     assert candidates.loc[candidates["symbol"] == "AAA", "rrg_quadrant"].iloc[0] == "Leading"
 
 
+def test_candidate_reasons_include_failed_200w_for_pandas_boolean():
+    config = PortfolioConfig(selected_seeds=("Seed B",), top_candidates_per_seed=5)
+    ranked = ranked_fixture()
+    ranked.loc[ranked["symbol"] == "BBB", "pass_200w"] = False
+    rrg_summary = pd.DataFrame(
+        [
+            {
+                "seed_universe": "Seed B",
+                "rrg_quadrant": "Lagging",
+                "rrg_score": 15.0,
+                "rrg_reason": "rrg_seed_weakening",
+            }
+        ]
+    )
+
+    candidates = build_portfolio_candidates(
+        ranked,
+        membership_fixture(),
+        rrg_summary,
+        config,
+    )
+
+    reasons = candidates.loc[candidates["symbol"] == "BBB", "reason_codes"].iloc[0]
+    assert "failed_200w" in reasons.split(", ")
+
+
 def test_allocation_respects_caps_and_cash_rule():
     candidates = pd.DataFrame(
         [
