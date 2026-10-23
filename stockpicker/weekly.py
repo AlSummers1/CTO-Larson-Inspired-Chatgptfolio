@@ -20,6 +20,16 @@ from .scoring import rank_universe
 from .signals import compute_signal_table
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _project_local_output(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_relative_to(PROJECT_ROOT):
+        raise ValueError(f"--output must stay inside the project directory: {PROJECT_ROOT}")
+    return resolved
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare a point-in-time Chatgptfolio weekly research packet.")
     parser.add_argument("--candidates", type=Path, help="CSV with at least symbol and technical score columns.")
@@ -36,6 +46,10 @@ def main() -> int:
         parser.error("provide --candidates or --sp500-master")
     if args.candidates and args.sp500_master:
         parser.error("use either --candidates or --sp500-master, not both")
+    try:
+        output_path = _project_local_output(args.output) if args.output else None
+    except ValueError as exc:
+        parser.error(str(exc))
     master = load_sp500_security_master() if args.sp500_master else None
     candidates = master.copy() if master is not None else pd.read_csv(args.candidates)
     if master is not None:
@@ -43,7 +57,12 @@ def main() -> int:
         metadata["theme"] = metadata["sector"]
         metadata["fundamental_score"] = 0.0
         metadata["catalyst_score"] = 0.0
-        prices = fetch_price_history(metadata["symbol"].tolist() + [args.benchmark], refresh=args.refresh_prices, years=args.years)
+        prices = fetch_price_history(
+            metadata["symbol"].tolist() + [args.benchmark],
+            refresh=args.refresh_prices,
+            years=args.years,
+            download_missing=args.refresh_prices,
+        )
         signals = compute_signal_table(prices, args.benchmark)
         candidates = rank_universe(signals.merge(metadata, on="symbol", how="left"))
     if "score" not in candidates:
@@ -53,8 +72,8 @@ def main() -> int:
     packet = research_packet(candidates, as_of, args.benchmark, LabConfig(), refresh_research=args.refresh_research, security_master=master)
     packet_hash = save_lab_research_snapshot(packet, DEFAULT_DB_PATH)
     save_lab_research_details(packet_hash, packet, DEFAULT_DB_PATH)
-    if args.output:
-        args.output.write_text(json.dumps(packet, indent=2, default=str), encoding="utf-8")
+    if output_path:
+        output_path.write_text(json.dumps(packet, indent=2, default=str), encoding="utf-8")
     print(json.dumps({"packet_hash": packet_hash, "candidates": len(packet["candidates"]), "coverage": packet["coverage"]}, default=str))
     return 0
 

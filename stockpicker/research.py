@@ -85,7 +85,7 @@ def alpha_vantage_api_key() -> str | None:
         return None
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-a", getpass.getuser(), "-s", ALPHA_VANTAGE_KEYCHAIN_SERVICE, "-w"],
+            ["/usr/bin/security", "find-generic-password", "-a", getpass.getuser(), "-s", ALPHA_VANTAGE_KEYCHAIN_SERVICE, "-w"],
             check=False,
             capture_output=True,
             text=True,
@@ -107,16 +107,59 @@ def evidence_record(
     status: str = "available",
     source_tier: str = "primary",
     source_domain: str | None = None,
-) -> dict[str, str | None]:
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
     fetched_at = _now()
     digest = hashlib.sha256(f"{symbol}|{category}|{title}|{source_url}|{published_at}".encode()).hexdigest()
-    return {
+    record: dict[str, object] = {
         "evidence_id": digest[:24], "symbol": symbol.upper(), "category": category,
         "title": title[:500], "summary": summary[:2_000], "source_url": source_url,
         "publisher": publisher, "published_at": published_at, "fetched_at": fetched_at,
         "content_hash": digest, "status": status,
         "source_tier": source_tier, "source_domain": source_domain or urlparse(source_url).netloc.lower(),
     }
+    if extra:
+        record.update(extra)
+    return record
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _news_window(window_end: datetime | None, as_of_date: date | None = None) -> tuple[datetime, datetime]:
+    """Return the exact 48-hour interval used for one news collection pass."""
+    if window_end is None:
+        if as_of_date is None:
+            window_end = datetime.now(timezone.utc)
+        else:
+            window_end = datetime.combine(as_of_date, datetime.max.time(), tzinfo=timezone.utc)
+    end = _as_utc(window_end)
+    return end - timedelta(hours=48), end
+
+
+def _published_timestamp(value: object) -> datetime | None:
+    """Parse provider timestamp variants and normalize them to UTC."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for pattern in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
+        try:
+            return datetime.strptime(text, pattern).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    parsed = pd.to_datetime(text, errors="coerce", utc=True)
+    return None if pd.isna(parsed) else parsed.to_pydatetime()
+
+
+def _in_news_window(published_at: object, start: datetime, end: datetime) -> tuple[bool, datetime | None]:
+    parsed = _published_timestamp(published_at)
+    return bool(parsed is not None and start <= parsed <= end), parsed
+
+
+def _numeric(value: object) -> float | None:
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return None if pd.isna(parsed) else float(parsed)
 
 
 def load_sp500_security_master() -> pd.DataFrame:
@@ -229,17 +272,27 @@ def fetch_sec_company_research(symbols: list[str], limit: int = 30) -> tuple[dic
     return output, evidence
 
 
-def fetch_gdelt_news(symbols: list[str], company_names: dict[str, str] | None = None, limit: int = 30, items_per_symbol: int = 5) -> list[dict[str, Any]]:
-    """Fetch bounded secondary news discovery; primary claims stay tied to SEC evidence."""
+def fetch_gdelt_news(
+    symbols: list[str],
+    company_names: dict[str, str] | None = None,
+    limit: int = 30,
+    items_per_symbol: int = 5,
+    window_end: datetime | None = None,
+    seen_urls: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch bounded GDELT fallback news, optionally constrained to a 48-hour window."""
     evidence: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
+    known_urls = set(seen_urls or set())
+    strict_window = window_end is not None
+    start, end = _news_window(window_end) if strict_window else (None, None)
     started_at = monotonic()
     for symbol in [str(value).upper() for value in symbols[:limit]]:
         company = (company_names or {}).get(symbol, symbol)
         query = f'"{company}"'
-        url = f"{GDELT_DOC_URL}?{urlencode({'query': query, 'mode': 'artlist', 'format': 'json', 'maxrecords': items_per_symbol, 'timespan': '7d'})}"
+        timespan = "48h" if strict_window else "7d"
+        url = f"{GDELT_DOC_URL}?{urlencode({'query': query, 'mode': 'artlist', 'format': 'json', 'maxrecords': items_per_symbol, 'timespan': timespan})}"
         if monotonic() - started_at >= NEWS_BUDGET_SECONDS:
-            evidence.append(evidence_record(symbol, "news", "GDELT time budget reached", "No secondary news was included before the connector time budget expired.", url, "GDELT", status="unavailable", source_tier="secondary_discovery"))
+            evidence.append(evidence_record(symbol, "news", "GDELT time budget reached", "No fallback news was included before the connector time budget expired.", url, "GDELT", status="unavailable", source_tier="secondary_discovery", extra={"news_channel": "gdelt_fallback"}))
             continue
         try:
             payload = _get_json(url)
@@ -247,17 +300,20 @@ def fetch_gdelt_news(symbols: list[str], company_names: dict[str, str] | None = 
             for article in payload.get("articles", []):
                 article_url = str(article.get("url", ""))
                 domain = str(article.get("domain", urlparse(article_url).netloc)).lower().removeprefix("www.")
-                if not article_url or article_url in seen_urls or domain in GDELT_DENYLIST:
+                if not article_url or article_url in known_urls or domain in GDELT_DENYLIST:
                     continue
-                seen_urls.add(article_url)
-                evidence.append(evidence_record(symbol, "news", str(article.get("title", "Untitled")), str(article.get("socialimage", "")), article_url, domain or "GDELT", str(article.get("seendate", "")) or None, source_tier="secondary_discovery", source_domain=domain))
+                published_at = str(article.get("seendate", "")) or None
+                if strict_window and not _in_news_window(published_at, start, end)[0]:
+                    continue
+                known_urls.add(article_url)
+                evidence.append(evidence_record(symbol, "news", str(article.get("title", "Untitled")), str(article.get("socialimage", "")), article_url, domain or "GDELT", published_at, source_tier="secondary_discovery", source_domain=domain, extra={"news_channel": "gdelt_fallback"}))
                 accepted += 1
                 if accepted >= items_per_symbol:
                     break
             if accepted == 0:
-                evidence.append(evidence_record(symbol, "news", "No eligible secondary articles", "GDELT returned no non-aggregated article for this company in the requested window.", url, "GDELT", status="unavailable", source_tier="secondary_discovery"))
+                evidence.append(evidence_record(symbol, "news", "No eligible fallback articles", "GDELT returned no non-aggregated article for this company in the requested window.", url, "GDELT", status="unavailable", source_tier="secondary_discovery", extra={"news_channel": "gdelt_fallback"}))
         except Exception as exc:
-            evidence.append(evidence_record(symbol, "news", "GDELT news unavailable", str(exc)[:160], url, "GDELT", status="unavailable", source_tier="secondary_discovery"))
+            evidence.append(evidence_record(symbol, "news", "GDELT news unavailable", str(exc)[:160], url, "GDELT", status="unavailable", source_tier="secondary_discovery", extra={"news_channel": "gdelt_fallback"}))
     return evidence
 
 
@@ -265,8 +321,9 @@ def fetch_alpha_vantage_news(
     symbols: list[str],
     as_of_date: date,
     items_per_symbol: int = 5,
+    window_end: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Fetch one bounded, ticker-linked Alpha Vantage news batch.
+    """Fetch recent ticker-linked Alpha Vantage news ranked by relevance/sentiment.
 
     A single multi-ticker request avoids consuming a request per candidate.  The
     credential is used only in the outgoing request; persisted evidence retains
@@ -279,11 +336,13 @@ def fetch_alpha_vantage_news(
     if not requested:
         return [], None
     requested = requested[:30]
-    start = as_of_date - timedelta(days=7)
+    start, end = _news_window(window_end, as_of_date)
     public_params = {
         "function": "NEWS_SENTIMENT",
         "tickers": ",".join(requested),
-        "time_from": start.strftime("%Y%m%dT0000"),
+        "time_from": start.strftime("%Y%m%dT%H%M"),
+        "time_to": end.strftime("%Y%m%dT%H%M"),
+        "sort": "RELEVANCE",
         "limit": min(200, max(25, len(requested) * items_per_symbol)),
     }
     public_url = f"{ALPHA_VANTAGE_URL}?{urlencode(public_params)}"
@@ -298,9 +357,8 @@ def fetch_alpha_vantage_news(
     feed = payload.get("feed", [])
     if not isinstance(feed, list):
         return [], "response did not contain a news feed"
-    evidence: list[dict[str, Any]] = []
+    per_symbol: dict[str, list[tuple[tuple[float, float, float], dict[str, object]]]] = {symbol: [] for symbol in requested}
     seen_urls: set[str] = set()
-    counts: dict[str, int] = {symbol: 0 for symbol in requested}
     for article in feed:
         if not isinstance(article, dict):
             continue
@@ -316,31 +374,47 @@ def fetch_alpha_vantage_news(
             continue
         seen_urls.add(article_url)
         for symbol in sorted(article_symbols):
-            if counts[symbol] >= items_per_symbol:
-                continue
             sentiment = next(
                 (item for item in article.get("ticker_sentiment", []) if isinstance(item, dict) and str(item.get("ticker", "")).upper() == symbol),
                 {},
             )
+            published_at = str(article.get("time_published", "")) or None
+            in_window, published_timestamp = _in_news_window(published_at, start, end)
+            if not in_window or published_timestamp is None:
+                continue
             sentiment_label = str(sentiment.get("ticker_sentiment_label", ""))
-            sentiment_score = str(sentiment.get("ticker_sentiment_score", ""))
+            sentiment_score = _numeric(sentiment.get("ticker_sentiment_score"))
+            relevance_score = _numeric(sentiment.get("relevance_score"))
             summary = str(article.get("summary", ""))
-            if sentiment_label:
-                summary = f"Alpha Vantage sentiment: {sentiment_label} ({sentiment_score}). {summary}".strip()
-            evidence.append(
-                evidence_record(
-                    symbol,
-                    "news",
-                    str(article.get("title", "Untitled")),
-                    summary,
-                    article_url,
-                    str(article.get("source", "Alpha Vantage")),
-                    str(article.get("time_published", "")) or None,
-                    source_tier="secondary_enrichment",
-                )
+            metadata = f"Alpha Vantage relevance: {relevance_score if relevance_score is not None else 'unavailable'}; ticker sentiment: {sentiment_label or 'unavailable'} ({sentiment_score if sentiment_score is not None else 'unavailable'})."
+            summary = f"{metadata} {summary}".strip()
+            record = evidence_record(
+                symbol,
+                "news",
+                str(article.get("title", "Untitled")),
+                summary,
+                article_url,
+                str(article.get("source", "Alpha Vantage")),
+                published_timestamp.isoformat(),
+                source_tier="secondary_enrichment",
+                extra={
+                    "news_channel": "alpha_vantage_primary",
+                    "relevance_score": relevance_score,
+                    "sentiment_score": sentiment_score,
+                    "sentiment_label": sentiment_label or None,
+                },
             )
-            counts[symbol] += 1
-    return evidence, None if evidence else "no ticker-linked articles in the requested window"
+            rank = (
+                relevance_score if relevance_score is not None else -1.0,
+                abs(sentiment_score) if sentiment_score is not None else -1.0,
+                published_timestamp.timestamp(),
+            )
+            per_symbol[symbol].append((rank, record))
+    evidence = []
+    for symbol in requested:
+        ranked = sorted(per_symbol[symbol], key=lambda item: item[0], reverse=True)
+        evidence.extend(record for _, record in ranked[:items_per_symbol])
+    return evidence, None if evidence else "no fresh ticker-linked articles in the requested 48-hour window"
 
 
 def fundamental_score(fundamentals: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:

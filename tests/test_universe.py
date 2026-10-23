@@ -292,6 +292,30 @@ EXPECTED_SEED_SYMBOLS = {
         "DDOG",
         "BAH",
     },
+    Path("data/universe_magnificent_seven.csv"): {
+        "AAPL",
+        "MSFT",
+        "GOOGL",
+        "AMZN",
+        "NVDA",
+        "META",
+        "TSLA",
+    },
+    Path("data/universe_space_exploration.csv"): {
+        "RKLB",
+        "LUNR",
+        "RDW",
+        "PL",
+        "BKSY",
+        "ASTS",
+        "IRDM",
+        "GSAT",
+        "VSAT",
+        "SPCE",
+        "LMT",
+        "NOC",
+        "BA",
+    },
 }
 
 
@@ -310,7 +334,7 @@ def test_seed_universe_files_have_expected_symbols(path: Path, expected_symbols:
     universe = load_universe(path)
 
     assert list(universe.columns) == UNIVERSE_COLUMNS
-    assert len(universe) == 20
+    assert len(universe) == len(expected_symbols)
     assert not universe["symbol"].duplicated().any()
     assert universe["theme"].astype(str).str.strip().ne("").all()
     assert set(universe["symbol"]) == expected_symbols

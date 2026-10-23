@@ -1,9 +1,11 @@
-from datetime import date
+from datetime import date, datetime, timezone
+import json
 
 import pandas as pd
+import pytest
 
 from stockpicker.data import load_lab_runs, save_lab_research_details, save_lab_research_snapshot, save_lab_run
-from stockpicker.lab import LabConfig, allowed_packet_references, correlation_summary, decision_schema_for_packet, entry_signal, evidence_health, openai_api_key, optimize_decision, paper_orders, prompt_for_packet, research_packet, validate_decision
+from stockpicker.lab import LabConfig, allowed_packet_references, compact_model_packet, correlation_summary, decision_schema_for_packet, entry_signal, evidence_health, openai_api_key, optimize_decision, packet_context_metadata, paper_orders, prompt_for_packet, research_packet, response_usage_metadata, validate_decision
 from stockpicker.research import alpha_vantage_api_key, fetch_alpha_vantage_news, fetch_gdelt_news
 
 
@@ -71,6 +73,22 @@ def test_packet_records_explicit_missing_research_without_fetching():
     assert packet["connector_timings_ms"] == {}
 
 
+def test_news_refresh_runs_without_the_broader_evidence_refresh(monkeypatch):
+    import stockpicker.lab as lab
+
+    alpha_evidence = [{"evidence_id": "alpha-1", "symbol": "NVDA", "category": "news", "title": "Update", "summary": "Test", "source_url": "https://alpha.example/nvda", "publisher": "Alpha", "published_at": "2026-07-13T11:00:00+00:00", "status": "available", "news_channel": "alpha_vantage_primary"}]
+    monkeypatch.setattr(lab, "fetch_macro_snapshot", lambda as_of: pytest.fail("macro refresh should stay disabled"))
+    monkeypatch.setattr(lab, "fetch_sec_company_research", lambda symbols, limit: pytest.fail("SEC refresh should stay disabled"))
+    monkeypatch.setattr(lab, "alpha_vantage_api_key", lambda: "configured")
+    monkeypatch.setattr(lab, "fetch_alpha_vantage_news", lambda symbols, as_of, **kwargs: (alpha_evidence, None))
+
+    packet = research_packet(_candidates(), date(2026, 7, 13), "SPY", refresh_research=False, refresh_news=True)
+
+    assert packet["coverage"]["fundamentals"] == "not_requested"
+    assert packet["coverage"]["alpha_vantage_news"] == "available"
+    assert packet["recent_news"]["window_end"] is not None
+
+
 def test_correlation_packet_flags_high_pairs_with_enough_observations():
     values = [100 + index for index in range(70)]
     summary = correlation_summary(pd.concat([_prices("AAA", values), _prices("BBB", values)], ignore_index=True), ["AAA"], held_symbols=["BBB"])
@@ -94,7 +112,160 @@ def test_validator_reports_correlation_warning_without_rejecting_valid_weights()
 
 
 def test_prompt_forbids_model_invented_entry_levels():
-    assert "Do NOT return entry prices" in prompt_for_packet({"candidates": []}, LabConfig())
+    prompt = prompt_for_packet({"candidates": [], "recent_news": {"by_symbol": {}}}, LabConfig())
+
+    assert "Do NOT return entry prices" in prompt
+    assert "Relevance and sentiment are evidence inputs, never automatic buy/sell instructions" in prompt
+    assert "include its evidence ID" in prompt
+
+
+def test_packet_includes_advisory_theme_breadth_and_candidate_memberships():
+    candidates = pd.DataFrame([
+        {
+            "symbol": "NVDA",
+            "name": "NVIDIA",
+            "theme": "AI",
+            "seed_memberships": "SMH Universe · Data Center Infrastructure Universe",
+            "latest_close": 100.0,
+            "score": 90.0,
+        }
+    ])
+    packet = research_packet(
+        candidates,
+        date(2026, 8, 19),
+        "QQQ",
+        theme_breadth=[
+            {
+                "seed_universe": "SMH Universe",
+                "observation_date": "2026-08-19",
+                "breadth": 0.8,
+                "breadth_4w_average": 0.7,
+                "breadth_change": 0.1,
+                "roc_50d": 0.12,
+                "confirmation": "Confirmed advance",
+                "coverage": 1.0,
+                "eligible_count": 20,
+                "universe_size": 20,
+            },
+            {
+                "seed_universe": "Utilities Universe",
+                "observation_date": "2026-08-19",
+                "breadth": 0.6,
+                "confirmation": "Confirmed advance",
+                "coverage": 0.5,
+                "eligible_count": 10,
+                "universe_size": 20,
+            },
+        ],
+    )
+
+    assert packet["candidates"][0]["seed_memberships"] == [
+        "SMH Universe",
+        "Data Center Infrastructure Universe",
+    ]
+    assert packet["theme_breadth"][0]["reference"] == "packet:theme_breadth:smh-universe"
+    assert packet["theme_breadth"][1]["confirmation"] == "Unresolved"
+    assert "packet:theme_breadth:smh-universe" in allowed_packet_references(packet)
+    prompt = prompt_for_packet(packet, LabConfig())
+    assert "breadth must never automatically exclude a candidate or determine position size" in prompt
+
+
+def test_compact_model_packet_removes_audit_duplicates_and_bounds_evidence():
+    candidates = [
+        {
+            "symbol": f"S{index:02d}",
+            "name": f"Company {index}",
+            "score": 90 - index,
+            "combined_score": 90 - index,
+            "entry": {"entry_label": "Add", "reason": "test"},
+            "correlation": {"status": "available", "max_daily_correlation": 0.5},
+        }
+        for index in range(30)
+    ]
+    matrix = {
+        left["symbol"]: {right["symbol"]: 0.5 for right in candidates}
+        for left in candidates
+    }
+    evidence = []
+    for candidate in candidates:
+        for index in range(5):
+            evidence.append({
+                "evidence_id": f"news-{candidate['symbol']}-{index}",
+                "symbol": candidate["symbol"],
+                "category": "news",
+                "title": "News",
+                "summary": "x" * 800,
+                "source_url": "https://example.com/private-audit-field",
+                "content_hash": "hash",
+                "status": "available",
+            })
+    packet = {
+        "packet_version": "test",
+        "as_of_date": "2026-08-19",
+        "benchmark": "QQQ",
+        "coverage": {"prices": "available"},
+        "candidates": candidates,
+        "candidate_scores": candidates,
+        "security_master": candidates,
+        "recent_news": {
+            "by_symbol": {
+                candidate["symbol"]: [
+                    item for item in evidence if item["symbol"] == candidate["symbol"]
+                ]
+                for candidate in candidates
+            }
+        },
+        "correlations": {"candidate_summary": [], "high_correlation_pairs": [], "daily_matrix": matrix},
+        "evidence": evidence,
+        "sources": [{"name": "audit"}],
+    }
+
+    compact = compact_model_packet(packet)
+
+    assert len(compact["candidates"]) == 30
+    assert "daily_matrix" not in compact.get("correlations", {})
+    assert "candidate_scores" not in compact
+    assert "security_master" not in compact
+    assert "recent_news" not in compact
+    assert len(compact["evidence"]) == 90
+    assert all("source_url" not in item and "content_hash" not in item for item in compact["evidence"])
+    assert all(len(item["summary"]) <= 500 for item in compact["evidence"])
+    full_size = len(json.dumps(packet, default=str, separators=(",", ":")))
+    compact_size = len(json.dumps(compact, default=str, separators=(",", ":")))
+    assert compact_size <= full_size * 0.70
+
+
+def test_context_metadata_and_response_usage_report_compact_request_tokens():
+    class Details:
+        cached_tokens = 120
+        cache_write_tokens = 10
+        reasoning_tokens = 80
+
+    class Usage:
+        input_tokens = 1000
+        input_tokens_details = Details()
+        output_tokens = 250
+        output_tokens_details = Details()
+        total_tokens = 1250
+
+    class Response:
+        usage = Usage()
+
+    usage = response_usage_metadata(Response())
+    packet = research_packet(_candidates(), date(2026, 8, 19), "QQQ")
+    metadata = packet_context_metadata(packet, LabConfig(), usage)
+
+    assert usage == {
+        "input_tokens": 1000,
+        "cached_input_tokens": 120,
+        "cache_write_input_tokens": 10,
+        "output_tokens": 250,
+        "reasoning_tokens": 80,
+        "total_tokens": 1250,
+    }
+    assert metadata["api_usage"] == usage
+    assert metadata["model_packet_characters"] <= metadata["full_packet_characters"]
+    assert metadata["estimated_input_tokens"] > 0
 
 
 def test_gdelt_evidence_is_secondary_and_deduplicated(monkeypatch):
@@ -140,6 +311,52 @@ def test_alpha_vantage_news_uses_one_keyless_audit_url_and_ticker_links(monkeypa
     assert all("test-key" not in str(row["source_url"]) for row in rows)
 
 
+def test_alpha_vantage_news_keeps_fresh_articles_by_relevance_then_sentiment(monkeypatch):
+    import stockpicker.research as research
+
+    requested_urls = []
+    monkeypatch.setattr(research, "alpha_vantage_api_key", lambda: "test-key")
+    monkeypatch.setattr(research, "_get_json", lambda url: requested_urls.append(url) or {"feed": [
+        {
+            "title": "High relevance, modest sentiment", "summary": "A", "url": "https://publisher.example/a", "source": "Publisher",
+            "time_published": "20260713T1100",
+            "ticker_sentiment": [{"ticker": "NVDA", "relevance_score": "0.9", "ticker_sentiment_label": "Bullish", "ticker_sentiment_score": "0.1"}],
+        },
+        {
+            "title": "High relevance, strong sentiment", "summary": "B", "url": "https://publisher.example/b", "source": "Publisher",
+            "time_published": "20260713T1000",
+            "ticker_sentiment": [{"ticker": "NVDA", "relevance_score": "0.9", "ticker_sentiment_label": "Bearish", "ticker_sentiment_score": "-0.8"}],
+        },
+        {
+            "title": "Lower relevance", "summary": "C", "url": "https://publisher.example/c", "source": "Publisher",
+            "time_published": "20260713T1130",
+            "ticker_sentiment": [{"ticker": "NVDA", "relevance_score": "0.8", "ticker_sentiment_label": "Bullish", "ticker_sentiment_score": "0.95"}],
+        },
+        {
+            "title": "Outside the 48-hour window", "summary": "Old", "url": "https://publisher.example/old", "source": "Publisher",
+            "time_published": "20260711T1159",
+            "ticker_sentiment": [{"ticker": "NVDA", "relevance_score": "1.0", "ticker_sentiment_label": "Bullish", "ticker_sentiment_score": "0.99"}],
+        },
+    ]})
+
+    rows, diagnostic = fetch_alpha_vantage_news(
+        ["NVDA"],
+        date(2026, 7, 13),
+        items_per_symbol=2,
+        window_end=datetime(2026, 7, 13, 12, tzinfo=timezone.utc),
+    )
+
+    assert diagnostic is None
+    assert "sort=RELEVANCE" in requested_urls[0]
+    assert "time_from=20260711T1200" in requested_urls[0]
+    assert "time_to=20260713T1200" in requested_urls[0]
+    assert [row["title"] for row in rows] == ["High relevance, strong sentiment", "High relevance, modest sentiment"]
+    assert rows[0]["relevance_score"] == 0.9
+    assert rows[0]["sentiment_score"] == -0.8
+    assert rows[0]["sentiment_label"] == "Bearish"
+    assert all(row["news_channel"] == "alpha_vantage_primary" for row in rows)
+
+
 def test_alpha_vantage_key_reads_macos_keychain_when_environment_is_missing(monkeypatch):
     import stockpicker.research as research
 
@@ -149,8 +366,10 @@ def test_alpha_vantage_key_reads_macos_keychain_when_environment_is_missing(monk
 
     monkeypatch.delenv("ALPHA_VANTAGE_API_KEY", raising=False)
     monkeypatch.setattr(research.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(research.subprocess, "run", lambda *args, **kwargs: Result())
+    calls = []
+    monkeypatch.setattr(research.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)) or Result())
     assert alpha_vantage_api_key() == "keychain-key"
+    assert calls[0][0][0][0] == "/usr/bin/security"
 
 
 def test_refreshed_packet_includes_alpha_vantage_source_health(monkeypatch):
@@ -159,15 +378,40 @@ def test_refreshed_packet_includes_alpha_vantage_source_health(monkeypatch):
     alpha_evidence = [{"evidence_id": "alpha-1", "symbol": "NVDA", "category": "news", "title": "Update", "summary": "Test", "source_url": "https://example.com", "publisher": "Publisher", "published_at": None, "fetched_at": "2026-07-13T12:00:00+00:00", "content_hash": "alpha", "status": "available", "source_tier": "secondary_enrichment", "source_domain": "example.com"}]
     monkeypatch.setattr(lab, "fetch_macro_snapshot", lambda as_of: ({"series": {"FEDFUNDS": {"value": 4.0}}}, []))
     monkeypatch.setattr(lab, "fetch_sec_company_research", lambda symbols, limit: ({"NVDA": {}}, []))
-    monkeypatch.setattr(lab, "fetch_gdelt_news", lambda symbols, names, limit: [])
+    monkeypatch.setattr(lab, "fetch_gdelt_news", lambda symbols, names, limit, **kwargs: [])
     monkeypatch.setattr(lab, "alpha_vantage_api_key", lambda: "configured")
-    monkeypatch.setattr(lab, "fetch_alpha_vantage_news", lambda symbols, as_of: (alpha_evidence, None))
+    monkeypatch.setattr(lab, "fetch_alpha_vantage_news", lambda symbols, as_of, **kwargs: (alpha_evidence, None))
 
     packet = research_packet(_candidates(), date(2026, 7, 13), "SPY", refresh_research=True)
 
     assert packet["coverage"]["alpha_vantage_news"] == "available"
-    assert packet["sources"][-1]["name"] == "Alpha Vantage ticker-linked news"
+    assert packet["sources"][-2]["name"] == "Alpha Vantage primary ticker news"
     assert packet["evidence"][-1]["evidence_id"] == "alpha-1"
+    assert packet["recent_news"]["by_symbol"]["NVDA"][0]["evidence_id"] == "alpha-1"
+
+
+def test_refreshed_packet_uses_gdelt_only_for_alpha_uncovered_symbols(monkeypatch):
+    import stockpicker.lab as lab
+
+    candidates = pd.DataFrame([
+        {"symbol": "NVDA", "name": "NVIDIA", "theme": "AI", "latest_close": 100.0, "score": 90.0},
+        {"symbol": "AMD", "name": "AMD", "theme": "AI", "latest_close": 80.0, "score": 80.0},
+    ])
+    alpha_evidence = [{"evidence_id": "alpha-1", "symbol": "NVDA", "category": "news", "title": "NVDA", "summary": "Test", "source_url": "https://alpha.example/nvda", "publisher": "Alpha", "published_at": "2026-07-13T11:00:00+00:00", "status": "available", "news_channel": "alpha_vantage_primary"}]
+    gdelt_calls = []
+    gdelt_evidence = [{"evidence_id": "gdelt-1", "symbol": "AMD", "category": "news", "title": "AMD", "summary": "Test", "source_url": "https://gdelt.example/amd", "publisher": "GDELT", "published_at": "2026-07-13T11:00:00+00:00", "status": "available", "news_channel": "gdelt_fallback"}]
+    monkeypatch.setattr(lab, "fetch_macro_snapshot", lambda as_of: ({"series": {"FEDFUNDS": {"value": 4.0}}}, []))
+    monkeypatch.setattr(lab, "fetch_sec_company_research", lambda symbols, limit: ({"NVDA": {}, "AMD": {}}, []))
+    monkeypatch.setattr(lab, "alpha_vantage_api_key", lambda: "configured")
+    monkeypatch.setattr(lab, "fetch_alpha_vantage_news", lambda symbols, as_of, **kwargs: (alpha_evidence, None))
+    monkeypatch.setattr(lab, "fetch_gdelt_news", lambda symbols, names, limit, **kwargs: gdelt_calls.append(symbols) or gdelt_evidence)
+
+    packet = research_packet(candidates, date(2026, 7, 13), "SPY", refresh_research=True)
+
+    assert gdelt_calls == [["AMD"]]
+    assert packet["coverage"]["news"] == "available"
+    assert packet["coverage"]["gdelt_news"] == "available"
+    assert set(packet["recent_news"]["by_symbol"]) == {"NVDA", "AMD"}
 
 
 def test_packet_freezes_supplied_security_master():
@@ -205,8 +449,10 @@ def test_openai_key_reads_macos_keychain_when_environment_is_missing(monkeypatch
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(lab.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(lab.subprocess, "run", lambda *args, **kwargs: Result())
+    calls = []
+    monkeypatch.setattr(lab.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)) or Result())
     assert openai_api_key() == "keychain-key"
+    assert calls[0][0][0][0] == "/usr/bin/security"
 
 
 def test_evidence_health_marks_missing_price_as_critical_and_unrequested_as_unresolved():
@@ -227,14 +473,16 @@ def test_validator_rejects_risk_reference_outside_packet():
 def test_packet_risk_references_allow_frozen_evidence_and_defined_technical_paths():
     candidates = pd.DataFrame([{"symbol": "AAA", "sector": "One"}])
     packet = {
-        "evidence": [{"evidence_id": "source-1"}],
+        "evidence": [{"evidence_id": "source-1", "status": "available"}],
         "candidates": [{"symbol": "AAA"}],
-        "correlations": {},
+        "correlations": {"daily_matrix": {"AAA": {"AAA": 1.0}}},
     }
     assert "source-1" in allowed_packet_references(packet)
     assert "packet:correlations.daily_matrix.AAA" in allowed_packet_references(packet)
+    compact_refs = allowed_packet_references(compact_model_packet(packet))
+    assert "packet:correlations.daily_matrix.AAA" not in compact_refs
     decision = {
-        "holdings": [{"symbol": "AAA", "weight": 0.5, "risk_flags": [{"severity": "medium", "evidence_refs": ["packet:correlations.daily_matrix.AAA"]}]}],
+        "holdings": [{"symbol": "AAA", "weight": 0.5, "risk_flags": [{"severity": "medium", "evidence_refs": ["packet:candidates:AAA"]}]}],
         "cash_weight": 0.5,
         "portfolio_risks": [{"severity": "low", "evidence_refs": ["source-1"]}],
     }
@@ -242,7 +490,7 @@ def test_packet_risk_references_allow_frozen_evidence_and_defined_technical_path
     assert result.valid
     schema = decision_schema_for_packet(packet)
     refs = schema["properties"]["portfolio_risks"]["items"]["properties"]["evidence_refs"]["items"]["enum"]
-    assert refs == allowed_packet_references(packet)
+    assert refs == compact_refs
 
 
 def test_validator_deduplicates_repeated_invalid_risk_references():

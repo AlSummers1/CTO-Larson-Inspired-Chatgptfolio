@@ -44,6 +44,28 @@ NUMERIC_PORTFOLIO_COLUMNS = {
     "drawdown_52w",
     "extension_sma50d",
 }
+PAPER_EXPERIMENT_CAPITAL = 100_000.0
+LEGACY_PAPER_PORTFOLIO_NAME = "Chatgptfolio Paper Portfolio"
+
+# These compact names are deliberately presentation-only.  The frozen decision
+# still retains the full source basket names in its audit trail.
+PAPER_BASKET_LABELS = {
+    "SMH Universe": "chips",
+    "Healthcare Universe": "healthcare",
+    "GLP-1 and Obesity Universe": "healthcare",
+    "Defence and Space Universe": "defense & space",
+    "Data Center Infrastructure Universe": "data-center infrastructure",
+    "Power Grid and Electrification Universe": "grid electrification",
+    "Utilities Universe": "utilities",
+    "Clean Energy Universe": "clean energy",
+    "Nuclear Energy Universe": "nuclear energy",
+    "Rare Earths and Strategic Materials Universe": "strategic materials",
+    "Crypto Universe": "crypto assets",
+    "Quantum Universe": "quantum",
+    "Cybersecurity Universe": "cybersecurity",
+    "Magnificent Seven Universe": "mega-cap technology",
+    "Space Exploration Universe": "space exploration",
+}
 
 
 def _import_duckdb():
@@ -58,6 +80,135 @@ def _connect(db_path: Path = DEFAULT_DB_PATH):
     duckdb = _import_duckdb()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return duckdb.connect(str(db_path))
+
+
+def _paper_experiment_name(run_id: int, model: object, approved_at: object) -> str:
+    """Build the stable, human-readable name for an independent experiment."""
+    approval_date = pd.to_datetime(approved_at, errors="coerce")
+    approval_label = approval_date.date().isoformat() if pd.notna(approval_date) else "unknown-date"
+    model_label = str(model or "unknown-model")
+    return f"Run {int(run_id)} — {model_label} — {approval_label}"
+
+
+def _json_object(value: object) -> dict[str, object]:
+    """Return a JSON object without letting legacy audit rows break the UI."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _paper_experiment_sensitivity(config_json: object) -> str:
+    """Translate frozen turnover settings into a short, human-readable label."""
+    config = _json_object(config_json)
+    explicit = str(config.get("sensitivity", config.get("experiment_sensitivity", ""))).strip().title()
+    if explicit in {"Conservative", "Balanced", "Aggressive"}:
+        return explicit
+    turnover = pd.to_numeric(pd.Series([config.get("max_turnover")]), errors="coerce").iloc[0]
+    if pd.isna(turnover):
+        # Earlier approved runs did not record this setting.  Their Lab default
+        # was a 35% turnover limit, which is the balanced profile.
+        return "Balanced"
+    if float(turnover) <= 0.25:
+        return "Conservative"
+    if float(turnover) >= 0.50:
+        return "Aggressive"
+    return "Balanced"
+
+
+def _paper_experiment_basket_description(decision_json: object) -> str:
+    """Summarize the largest frozen thematic sleeves in an approved decision."""
+    decision = _json_object(decision_json)
+    holdings = decision.get("holdings", [])
+    if not isinstance(holdings, list):
+        return "Long selected equities"
+    exposure: dict[str, float] = {}
+    for holding in holdings:
+        if not isinstance(holding, dict):
+            continue
+        raw_baskets = str(
+            holding.get("seed_universe") or holding.get("basket") or holding.get("sector") or holding.get("theme") or ""
+        )
+        if not raw_baskets:
+            continue
+        weight = pd.to_numeric(pd.Series([holding.get("weight", 0.0)]), errors="coerce").iloc[0]
+        position_weight = float(weight) if pd.notna(weight) and float(weight) > 0 else 1.0
+        baskets = [value.strip() for value in raw_baskets.split(" · ") if value.strip()]
+        if not baskets:
+            continue
+        for basket in baskets:
+            label = PAPER_BASKET_LABELS.get(basket, basket.removesuffix(" Universe").lower())
+            exposure[label] = exposure.get(label, 0.0) + position_weight / len(baskets)
+    if not exposure:
+        return "Long selected equities"
+    labels = [label for label, _ in sorted(exposure.items(), key=lambda item: (-item[1], item[0]))[:3]]
+    if len(labels) == 1:
+        return f"Long {labels[0]}"
+    if len(labels) == 2:
+        return f"Long {labels[0]} & {labels[1]}"
+    return f"Long {labels[0]}, {labels[1]} & {labels[2]}"
+
+
+def _ensure_paper_experiment(conn, run_id: int, model: object, approved_at: object) -> int:
+    """Return the one independent experiment belonging to a Lab run."""
+    existing = conn.execute(
+        "SELECT portfolio_id FROM lab_paper_portfolios WHERE run_id = ? ORDER BY portfolio_id LIMIT 1",
+        [int(run_id)],
+    ).fetchone()
+    if existing:
+        return int(existing[0])
+    return int(
+        conn.execute(
+            """INSERT INTO lab_paper_portfolios
+               (name, initial_capital, created_at, status, run_id, model, approval_date)
+               VALUES (?, ?, ?, 'active', ?, ?, ?) RETURNING portfolio_id""",
+            [
+                _paper_experiment_name(run_id, model, approved_at),
+                PAPER_EXPERIMENT_CAPITAL,
+                datetime.now(timezone.utc).replace(tzinfo=None),
+                int(run_id),
+                str(model or "unknown-model"),
+                pd.to_datetime(approved_at, errors="coerce").date() if pd.notna(pd.to_datetime(approved_at, errors="coerce")) else None,
+            ],
+        ).fetchone()[0]
+    )
+
+
+def _migrate_legacy_pending_paper_rebalances(conn) -> list[int]:
+    """Split old default-portfolio pending approvals into immutable experiments.
+
+    Only pending rows in the historical default destination are moved.  Fills,
+    decisions, costs, and frozen research remain untouched, making this safe to
+    run on every database initialization.
+    """
+    pending = conn.execute(
+        """SELECT r.rebalance_id, r.run_id, r.approved_at, l.model
+           FROM lab_paper_rebalances r
+           JOIN lab_paper_portfolios p ON r.portfolio_id = p.portfolio_id
+           LEFT JOIN lab_runs l ON r.run_id = l.run_id
+           WHERE r.status = 'pending' AND p.name = ?
+           ORDER BY r.rebalance_id""",
+        [LEGACY_PAPER_PORTFOLIO_NAME],
+    ).fetchall()
+    migrated: list[int] = []
+    for rebalance_id, run_id, approved_at, model in pending:
+        experiment_id = _ensure_paper_experiment(conn, int(run_id), model, approved_at)
+        conn.execute(
+            "UPDATE lab_paper_rebalances SET portfolio_id = ? WHERE rebalance_id = ?",
+            [experiment_id, int(rebalance_id)],
+        )
+        migrated.append(int(rebalance_id))
+    if migrated:
+        conn.execute(
+            "UPDATE lab_paper_portfolios SET status = 'legacy' WHERE name = ?",
+            [LEGACY_PAPER_PORTFOLIO_NAME],
+        )
+    return migrated
 
 
 @lru_cache(maxsize=32)
@@ -192,7 +343,8 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lab_paper_portfolios (
                 portfolio_id INTEGER DEFAULT nextval('lab_paper_portfolio_id_seq') PRIMARY KEY,
-                name VARCHAR UNIQUE, initial_capital DOUBLE, created_at TIMESTAMP, status VARCHAR
+                name VARCHAR UNIQUE, initial_capital DOUBLE, created_at TIMESTAMP, status VARCHAR,
+                run_id INTEGER, model VARCHAR, approval_date DATE
             )
         """)
         conn.execute("""
@@ -235,11 +387,21 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
         """)
         conn.execute("ALTER TABLE lab_runs ADD COLUMN IF NOT EXISTS request_settings_json VARCHAR")
         conn.execute("ALTER TABLE lab_runs ADD COLUMN IF NOT EXISTS context_metadata_json VARCHAR")
+        conn.execute("ALTER TABLE lab_paper_portfolios ADD COLUMN IF NOT EXISTS run_id INTEGER")
+        conn.execute("ALTER TABLE lab_paper_portfolios ADD COLUMN IF NOT EXISTS model VARCHAR")
+        conn.execute("ALTER TABLE lab_paper_portfolios ADD COLUMN IF NOT EXISTS approval_date DATE")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS lab_paper_valuation_state (
                 portfolio_id INTEGER PRIMARY KEY, input_fingerprint VARCHAR, rebuilt_at TIMESTAMP
             )
         """)
+        _migrate_legacy_pending_paper_rebalances(conn)
+        # The former singleton is retained as an auditable record only.  It is
+        # never an active experiment or a destination for future approvals.
+        conn.execute(
+            "UPDATE lab_paper_portfolios SET status = 'legacy' WHERE name = ? AND run_id IS NULL",
+            [LEGACY_PAPER_PORTFOLIO_NAME],
+        )
 
 
 def _normalize_symbols(symbols: Iterable[str]) -> list[str]:
@@ -432,6 +594,7 @@ def fetch_price_history(
     refresh: bool = False,
     years: int = 10,
     db_path: Path = DEFAULT_DB_PATH,
+    download_missing: bool = False,
 ) -> pd.DataFrame:
     """Fetch adjusted daily price history, using DuckDB as a local cache."""
     requested = _normalize_symbols(symbols)
@@ -440,7 +603,7 @@ def fetch_price_history(
 
     cached = pd.DataFrame(columns=PRICE_COLUMNS) if refresh else read_cached_prices(requested, db_path)
     cached_symbols = set(cached["symbol"].unique()) if not cached.empty else set()
-    to_download = requested if refresh else [symbol for symbol in requested if symbol not in cached_symbols]
+    to_download = requested if refresh else ([symbol for symbol in requested if symbol not in cached_symbols] if download_missing else [])
 
     if to_download:
         downloaded = download_prices(to_download, years=years)
@@ -607,16 +770,85 @@ def load_lab_runs(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
 
 
 def default_paper_portfolio(initial_capital: float = 100_000.0, db_path: Path = DEFAULT_DB_PATH) -> int:
-    """Return the one local paper portfolio, creating it lazily when needed."""
+    """Return the historical default destination, retained only for audit compatibility."""
     init_database(db_path)
     with _connect(db_path) as conn:
-        row = conn.execute("SELECT portfolio_id FROM lab_paper_portfolios WHERE name = 'Chatgptfolio Paper Portfolio'").fetchone()
+        row = conn.execute("SELECT portfolio_id FROM lab_paper_portfolios WHERE name = ?", [LEGACY_PAPER_PORTFOLIO_NAME]).fetchone()
         if row:
             return int(row[0])
         return int(conn.execute(
             "INSERT INTO lab_paper_portfolios (name, initial_capital, created_at, status) VALUES (?, ?, ?, ?) RETURNING portfolio_id",
-            ["Chatgptfolio Paper Portfolio", initial_capital, datetime.now(timezone.utc).replace(tzinfo=None), "active"],
+            [LEGACY_PAPER_PORTFOLIO_NAME, initial_capital, datetime.now(timezone.utc).replace(tzinfo=None), "legacy"],
         ).fetchone()[0])
+
+
+def migrate_legacy_pending_paper_rebalances(db_path: Path = DEFAULT_DB_PATH) -> list[int]:
+    """Run the idempotent one-time split for old default-portfolio approvals."""
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return _migrate_legacy_pending_paper_rebalances(conn)
+
+
+def load_paper_experiments(db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    """Return active independent paper experiments with their current summary."""
+    init_database(db_path)
+    columns = [
+        "portfolio_id", "name", "run_id", "model", "status", "approval_date", "fill_date",
+        "initial_capital", "nav", "return", "drawdown", "holding_count", "has_pending",
+        "sensitivity", "basket_description",
+    ]
+    with _connect(db_path) as conn:
+        portfolios = conn.execute(
+            """SELECT portfolio_id, name, run_id, model, status, approval_date, initial_capital
+               FROM lab_paper_portfolios WHERE status = 'active' ORDER BY approval_date, portfolio_id"""
+        ).fetchdf()
+        rebalances = conn.execute(
+            """SELECT portfolio_id, rebalance_id, status, effective_date, config_json, decision_json
+               FROM lab_paper_rebalances ORDER BY rebalance_id"""
+        ).fetchdf()
+        nav = conn.execute(
+            """SELECT portfolio_id, date, nav, drawdown FROM lab_paper_daily_nav
+               ORDER BY portfolio_id, date"""
+        ).fetchdf()
+        positions = conn.execute(
+            """SELECT r.portfolio_id, r.rebalance_id, p.symbol
+               FROM lab_paper_rebalances r JOIN lab_paper_positions p ON r.rebalance_id = p.rebalance_id
+               WHERE r.status = 'executed'"""
+        ).fetchdf()
+    if portfolios.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, object]] = []
+    for _, experiment in portfolios.iterrows():
+        portfolio_id = int(experiment["portfolio_id"])
+        experiment_rebalances = rebalances[rebalances["portfolio_id"] == portfolio_id]
+        executed = experiment_rebalances[experiment_rebalances["status"] == "executed"]
+        experiment_nav = nav[nav["portfolio_id"] == portfolio_id]
+        latest_rebalance = experiment_rebalances.sort_values("rebalance_id").iloc[-1] if not experiment_rebalances.empty else None
+        latest_nav = float(experiment_nav.iloc[-1]["nav"]) if not experiment_nav.empty else float("nan")
+        capital = pd.to_numeric(pd.Series([experiment["initial_capital"]]), errors="coerce").iloc[0]
+        initial_capital = float(capital) if pd.notna(capital) and float(capital) > 0 else PAPER_EXPERIMENT_CAPITAL
+        latest_rebalance_id = int(executed["rebalance_id"].max()) if not executed.empty else None
+        holding_count = 0
+        if latest_rebalance_id is not None:
+            holding_count = int(len(positions[(positions["portfolio_id"] == portfolio_id) & (positions["rebalance_id"] == latest_rebalance_id)]))
+        rows.append({
+            "portfolio_id": portfolio_id,
+            "name": experiment["name"],
+            "run_id": experiment["run_id"],
+            "model": experiment["model"],
+            "status": experiment["status"],
+            "approval_date": experiment["approval_date"],
+            "fill_date": executed["effective_date"].max() if not executed.empty else None,
+            "initial_capital": initial_capital,
+            "nav": latest_nav,
+            "return": latest_nav / initial_capital - 1.0 if pd.notna(latest_nav) and initial_capital else float("nan"),
+            "drawdown": float(experiment_nav["drawdown"].min()) if not experiment_nav.empty else float("nan"),
+            "holding_count": holding_count,
+            "has_pending": bool((experiment_rebalances["status"] == "pending").any()),
+            "sensitivity": _paper_experiment_sensitivity(latest_rebalance["config_json"] if latest_rebalance is not None else None),
+            "basket_description": _paper_experiment_basket_description(latest_rebalance["decision_json"] if latest_rebalance is not None else None),
+        })
+    return pd.DataFrame(rows, columns=columns)
 
 
 def load_paper_rebalances(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
@@ -660,22 +892,30 @@ def paper_portfolio_weights(prices: pd.DataFrame, portfolio_id: int | None = Non
 
 
 def paper_valuation_symbols(portfolio_id: int | None = None, db_path: Path = DEFAULT_DB_PATH) -> list[str]:
-    """Return the held, benchmark, and frozen technical-baseline symbols needed for valuation."""
-    portfolio_id = portfolio_id or default_paper_portfolio(db_path=db_path)
+    """Return valuation symbols for one experiment, or every active experiment."""
     init_database(db_path)
     symbols = {"SPY", "QQQ", "GLD", "BTC-USD"}
     with _connect(db_path) as conn:
+        if portfolio_id is None:
+            portfolio_ids = [int(row[0]) for row in conn.execute(
+                "SELECT portfolio_id FROM lab_paper_portfolios WHERE status = 'active'"
+            ).fetchall()]
+        else:
+            portfolio_ids = [int(portfolio_id)]
+        if not portfolio_ids:
+            return sorted(symbols)
+        placeholders = ", ".join(["?"] * len(portfolio_ids))
         held = conn.execute(
-            """SELECT DISTINCT p.symbol FROM lab_paper_positions p
+            f"""SELECT DISTINCT p.symbol FROM lab_paper_positions p
                JOIN lab_paper_rebalances r ON p.rebalance_id = r.rebalance_id
-               WHERE r.portfolio_id = ? AND r.status = 'executed'""", [portfolio_id]
+               WHERE r.portfolio_id IN ({placeholders}) AND r.status = 'executed'""", portfolio_ids
         ).fetchall()
         symbols.update(str(row[0]).upper() for row in held)
         packets = conn.execute(
-            """SELECT r.status, r.config_json, r.decision_json, s.packet_json FROM lab_paper_rebalances r
+            f"""SELECT r.status, r.config_json, r.decision_json, s.packet_json FROM lab_paper_rebalances r
                JOIN lab_runs l ON r.run_id = l.run_id
                JOIN lab_research_snapshots s ON l.packet_hash = s.snapshot_hash
-               WHERE r.portfolio_id = ? AND r.status IN ('executed', 'pending')""", [portfolio_id]
+               WHERE r.portfolio_id IN ({placeholders}) AND r.status IN ('executed', 'pending')""", portfolio_ids
         ).fetchall()
     for status, config_json, decision_json, packet_json in packets:
         try:
@@ -713,6 +953,19 @@ def load_paper_portfolio_dashboard(portfolio_id: int | None = None, db_path: Pat
     return nav, benchmarks, rebalances, positions
 
 
+def load_paper_fills(portfolio_id: int, db_path: Path = DEFAULT_DB_PATH) -> pd.DataFrame:
+    """Load the immutable fill audit trail for one experiment."""
+    init_database(db_path)
+    with _connect(db_path) as conn:
+        return conn.execute(
+            """SELECT r.rebalance_id, r.run_id, r.effective_date, f.symbol, f.action, f.quantity,
+                      f.fill_price, f.notional, f.estimated_cost, f.filled_at
+               FROM lab_paper_rebalances r JOIN lab_paper_fills f ON r.rebalance_id = f.rebalance_id
+               WHERE r.portfolio_id = ? ORDER BY f.filled_at, r.rebalance_id, f.symbol""",
+            [int(portfolio_id)],
+        ).fetchdf()
+
+
 def approve_paper_rebalance(
     run_id: int,
     decision: dict[str, object],
@@ -721,18 +974,26 @@ def approve_paper_rebalance(
     portfolio_id: int | None = None,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> int:
-    """Save an approval as pending; it fills only at the next cached market open."""
-    portfolio_id = portfolio_id or default_paper_portfolio(float(config.get("paper_capital", 100_000.0)), db_path)
+    """Approve a run as its own $100,000 pending paper experiment.
+
+    ``portfolio_id`` remains accepted for callers from the single-portfolio
+    version, but is deliberately ignored: an approval must never rebalance or
+    otherwise mutate a different experiment.
+    """
     init_database(db_path)
     with _connect(db_path) as conn:
         existing = conn.execute("SELECT rebalance_id FROM lab_paper_rebalances WHERE run_id = ?", [run_id]).fetchone()
         if existing:
             return int(existing[0])
+        run = conn.execute("SELECT model FROM lab_runs WHERE run_id = ?", [int(run_id)]).fetchone()
+        model = run[0] if run else None
+        approved_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        experiment_id = _ensure_paper_experiment(conn, int(run_id), model, approved_at)
         return int(conn.execute(
             """INSERT INTO lab_paper_rebalances
                (portfolio_id, run_id, approved_at, status, config_json, decision_json, note)
                VALUES (?, ?, ?, 'pending', ?, ?, ?) RETURNING rebalance_id""",
-            [portfolio_id, run_id, datetime.now(timezone.utc).replace(tzinfo=None), json.dumps(config, default=str), json.dumps(decision, default=str), f"Awaiting next open after {as_of_date.isoformat()}"],
+            [experiment_id, run_id, approved_at, json.dumps(config, default=str), json.dumps(decision, default=str), f"Awaiting next open after {as_of_date.isoformat()}"],
         ).fetchone()[0])
 
 

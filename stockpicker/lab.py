@@ -5,12 +5,13 @@ The model proposes allocations; deterministic validation is always authoritative
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import getpass
 import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 from time import perf_counter
 from typing import Any
@@ -21,9 +22,11 @@ from .research import alpha_vantage_api_key, fetch_alpha_vantage_news, fetch_mac
 
 MODEL_OPTIONS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 DEFAULT_MODEL = "gpt-5.5"
-PROMPT_VERSION = "chatgptfolio-v3-reliability-lab"
+PROMPT_VERSION = "chatgptfolio-v5-theme-breadth-compact"
 SEVERITY_ORDER = ("critical", "high", "medium", "low", "unresolved")
 SEVERITY_COLORS = {"critical": "#dc2626", "high": "#f97316", "medium": "#eab308", "low": "#22c55e", "unresolved": "#94a3b8"}
+MODEL_EVIDENCE_SUMMARY_CHARS = 500
+MODEL_EVIDENCE_LIMITS = {"fundamental": 1, "corporate_event": 3, "news": 3}
 
 
 @dataclass(frozen=True)
@@ -124,17 +127,34 @@ def credential_status(last_error: str | None = None) -> str:
     return "ready" if openai_api_key() else "missing"
 
 
-def packet_context_metadata(packet: dict[str, object], config: LabConfig) -> dict[str, object]:
+def packet_context_metadata(
+    packet: dict[str, object],
+    config: LabConfig,
+    api_usage: dict[str, int] | None = None,
+) -> dict[str, object]:
     """A reproducible context estimate, not a billing estimate or secret trace."""
-    serialized = json.dumps(packet, default=str, separators=(",", ":"))
-    return {
-        "packet_characters": len(serialized),
-        "estimated_input_tokens": round(len(serialized) / 4),
+    full_serialized = json.dumps(packet, default=str, separators=(",", ":"))
+    model_packet = compact_model_packet(packet)
+    model_serialized = json.dumps(model_packet, default=str, separators=(",", ":"))
+    prompt = prompt_for_packet(packet, config)
+    reduction = 0.0 if not full_serialized else 1.0 - len(model_serialized) / len(full_serialized)
+    metadata: dict[str, object] = {
+        "packet_characters": len(full_serialized),
+        "full_packet_characters": len(full_serialized),
+        "model_packet_characters": len(model_serialized),
+        "prompt_characters": len(prompt),
+        "estimated_input_tokens": round(len(prompt) / 4),
+        "estimated_packet_reduction_pct": round(100.0 * reduction, 1),
         "candidate_count": len(packet.get("candidates", [])),
         "evidence_count": len(packet.get("evidence", [])),
+        "model_evidence_count": len(model_packet.get("evidence", [])),
+        "theme_breadth_count": len(model_packet.get("theme_breadth", [])),
         "model": config.model,
         "prompt_version": PROMPT_VERSION,
     }
+    if api_usage:
+        metadata["api_usage"] = api_usage
+    return metadata
 
 
 def preflight_packet(packet: dict[str, object], credential: str) -> ValidationResult:
@@ -151,11 +171,93 @@ def preflight_packet(packet: dict[str, object], credential: str) -> ValidationRe
     return ValidationResult(not errors, errors)
 
 
+def recent_news_payload(
+    evidence: list[dict[str, object]],
+    window_start: datetime | None,
+    window_end: datetime | None,
+) -> dict[str, object]:
+    """Keep the recent, ticker-scoped news context explicit for the model audit."""
+    by_symbol: dict[str, list[dict[str, object]]] = {}
+    for item in evidence:
+        if not isinstance(item, dict) or item.get("category") != "news" or item.get("status") != "available":
+            continue
+        symbol = str(item.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        by_symbol.setdefault(symbol, []).append(
+            {
+                key: item.get(key)
+                for key in [
+                    "evidence_id", "title", "publisher", "published_at", "source_url",
+                    "news_channel", "relevance_score", "sentiment_score", "sentiment_label",
+                ]
+            }
+        )
+    return {
+        "window_start": window_start.isoformat() if window_start else None,
+        "window_end": window_end.isoformat() if window_end else None,
+        "by_symbol": by_symbol,
+        "policy": "Alpha Vantage is primary. GDELT is used only for symbols without fresh Alpha Vantage coverage.",
+    }
+
+
 def _liquidity_score(row: pd.Series) -> float:
     volume = pd.to_numeric(row.get("avg_dollar_volume", row.get("volume", 0)), errors="coerce")
     if pd.isna(volume) or volume <= 0:
         return 50.0
     return float(max(0, min(100, 50 + 10 * (len(str(int(volume))) - 6))))
+
+
+def theme_breadth_reference(seed_universe: object) -> str:
+    """Return a stable packet reference for one fixed seed universe."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(seed_universe).strip().lower()).strip("-")
+    return f"packet:theme_breadth:{slug or 'unresolved'}"
+
+
+def _optional_number(value: object, digits: int = 4) -> float | None:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return None if pd.isna(number) else round(float(number), digits)
+
+
+def _seed_membership_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str):
+        raw = value.split(" · ")
+    else:
+        raw = []
+    return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+
+
+def normalize_theme_breadth(rows: list[dict[str, object]] | None) -> list[dict[str, object]]:
+    """Freeze latest seed breadth snapshots into a compact, JSON-safe shape."""
+    normalized: list[dict[str, object]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        seed_universe = str(row.get("seed_universe", "")).strip()
+        if not seed_universe:
+            continue
+        coverage = _optional_number(row.get("coverage"))
+        confirmation = str(row.get("confirmation", "Unresolved") or "Unresolved")
+        if coverage is None or coverage < 0.75:
+            confirmation = "Unresolved"
+        normalized.append(
+            {
+                "seed_universe": seed_universe,
+                "reference": theme_breadth_reference(seed_universe),
+                "observation_date": str(row.get("observation_date") or row.get("date") or "") or None,
+                "breadth": _optional_number(row.get("breadth")),
+                "breadth_4w_average": _optional_number(row.get("breadth_4w_average")),
+                "breadth_change": _optional_number(row.get("breadth_change")),
+                "roc_50d": _optional_number(row.get("roc_50d")),
+                "confirmation": confirmation,
+                "coverage": coverage,
+                "eligible_count": int(_optional_number(row.get("eligible_count"), 0) or 0),
+                "universe_size": int(_optional_number(row.get("universe_size"), 0) or 0),
+            }
+        )
+    return normalized
 
 
 def research_packet(
@@ -164,17 +266,20 @@ def research_packet(
     benchmark: str,
     config: LabConfig | None = None,
     refresh_research: bool = False,
+    refresh_news: bool = False,
     security_master: pd.DataFrame | None = None,
     prices: pd.DataFrame | None = None,
     held_symbols: list[str] | None = None,
+    theme_breadth: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Create a bounded, timestamped packet using only recorded source evidence.
 
     Live public connectors are opt-in so simply rendering the dashboard never causes
-    dozens of network requests.  Missing coverage is surfaced to the model and UI.
+    dozens of network requests. ``refresh_news`` lets analysis runs always collect
+    fresh ticker news even when the broader evidence refresh is disabled.
     """
     config = config or LabConfig()
-    columns = [column for column in ["symbol", "name", "theme", "sector", "industry", "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score", "drawdown_52w", "extension_sma50d", "larsson_regime", "daily_trend", "weekly_trend", "monthly_trend", "data_warnings"] if column in candidates]
+    columns = [column for column in ["symbol", "name", "theme", "seed_memberships", "sector", "industry", "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score", "drawdown_52w", "extension_sma50d", "larsson_regime", "daily_trend", "weekly_trend", "monthly_trend", "data_warnings"] if column in candidates]
     facts = candidates[columns].head(config.research_limit).copy() if not candidates.empty else pd.DataFrame(columns=columns)
     if "sector" not in facts:
         facts["sector"] = facts.get("theme", "Unclassified")
@@ -187,9 +292,18 @@ def research_packet(
     fundamentals: dict[str, dict[str, Any]] = {}
     evidence: list[dict[str, Any]] = []
     macro: dict[str, Any] = {"as_of_date": as_of_date.isoformat(), "regime": "unavailable", "series": {}}
-    source_status = {"prices": "available", "fundamentals": "not_requested", "events": "not_requested", "macro": "not_requested", "news": "not_requested", "alpha_vantage_news": "not_configured"}
+    source_status = {
+        "prices": "available", "fundamentals": "not_requested", "events": "not_requested",
+        "macro": "not_requested", "news": "not_requested", "alpha_vantage_news": "not_configured",
+        "gdelt_news": "not_requested",
+    }
     connector_timings: dict[str, float] = {}
     source_diagnostics: dict[str, str] = {}
+    news_window_start: datetime | None = None
+    news_window_end: datetime | None = None
+    recent_news_evidence: list[dict[str, object]] = []
+    macro_evidence: list[dict[str, object]] = []
+    sec_evidence: list[dict[str, object]] = []
     if refresh_research:
         started_at = perf_counter()
         macro, macro_evidence = fetch_macro_snapshot(as_of_date)
@@ -198,24 +312,10 @@ def research_packet(
         fundamentals, sec_evidence = fetch_sec_company_research(symbols, config.research_limit)
         connector_timings["fundamentals"] = round((perf_counter() - started_at) * 1000, 1)
         connector_timings["events"] = connector_timings["fundamentals"]
-        started_at = perf_counter()
-        names = {str(row.get("symbol", "")).upper(): str(row.get("name", row.get("symbol", ""))) for _, row in facts.iterrows()}
-        news_evidence = fetch_gdelt_news(symbols, names, config.research_limit)
-        connector_timings["news"] = round((perf_counter() - started_at) * 1000, 1)
-        alpha_news_evidence: list[dict[str, Any]] = []
-        alpha_diagnostic: str | None = None
-        alpha_available = bool(alpha_vantage_api_key())
-        if alpha_available:
-            started_at = perf_counter()
-            alpha_news_evidence, alpha_diagnostic = fetch_alpha_vantage_news(symbols, as_of_date)
-            connector_timings["alpha_vantage_news"] = round((perf_counter() - started_at) * 1000, 1)
-        evidence = macro_evidence + sec_evidence + news_evidence + alpha_news_evidence
         source_status.update({
             "fundamentals": "available" if fundamentals else "unavailable",
             "events": "available" if sec_evidence else "unavailable",
             "macro": "available" if macro.get("series") else "unavailable",
-            "news": "available" if any(item.get("status") == "available" for item in news_evidence) else "unavailable",
-            "alpha_vantage_news": "available" if alpha_news_evidence else ("unavailable" if alpha_available else "not_configured"),
         })
         macro_failures = [str(item.get("reason", "")) for item in macro.get("series", {}).values() if isinstance(item, dict) and item.get("reason")]
         sec_failures = [str(item.get("reason", "")) for item in fundamentals.values() if isinstance(item, dict) and item.get("reason")]
@@ -224,15 +324,67 @@ def research_packet(
         if sec_failures:
             source_diagnostics["fundamentals"] = sec_failures[0][:160]
             source_diagnostics["events"] = sec_failures[0][:160]
-        if any(item.get("status") == "unavailable" for item in news_evidence):
-            source_diagnostics["news"] = "One or more GDELT requests were unavailable; retry on the next refresh."
+
+    if refresh_research or refresh_news:
+        names = {str(row.get("symbol", "")).upper(): str(row.get("name", row.get("symbol", ""))) for _, row in facts.iterrows()}
+        alpha_news_evidence: list[dict[str, Any]] = []
+        alpha_diagnostic: str | None = None
+        alpha_available = bool(alpha_vantage_api_key())
+        news_window_end = datetime.now(timezone.utc)
+        news_window_start = news_window_end - timedelta(hours=48)
+        if alpha_available:
+            started_at = perf_counter()
+            alpha_news_evidence, alpha_diagnostic = fetch_alpha_vantage_news(
+                symbols,
+                as_of_date,
+                window_end=news_window_end,
+            )
+            connector_timings["alpha_vantage_news"] = round((perf_counter() - started_at) * 1000, 1)
+        else:
+            alpha_diagnostic = "credential not configured"
+        alpha_covered_symbols = {
+            str(item.get("symbol", "")).upper()
+            for item in alpha_news_evidence
+            if item.get("status") == "available"
+        }
+        fallback_symbols = [symbol for symbol in symbols if symbol not in alpha_covered_symbols]
+        gdelt_news_evidence: list[dict[str, Any]] = []
+        if fallback_symbols:
+            started_at = perf_counter()
+            alpha_urls = {
+                str(item.get("source_url", ""))
+                for item in alpha_news_evidence
+                if item.get("status") == "available" and item.get("source_url")
+            }
+            gdelt_news_evidence = fetch_gdelt_news(
+                fallback_symbols,
+                names,
+                config.research_limit,
+                window_end=news_window_end,
+                seen_urls=alpha_urls,
+            )
+            connector_timings["gdelt_news"] = round((perf_counter() - started_at) * 1000, 1)
+        recent_news_evidence = alpha_news_evidence + gdelt_news_evidence
+        available_recent_news = any(item.get("status") == "available" for item in recent_news_evidence)
+        source_status.update({
+            "news": "available" if available_recent_news else "unavailable",
+            "alpha_vantage_news": "available" if alpha_news_evidence else ("unavailable" if alpha_available else "not_configured"),
+            "gdelt_news": "available" if any(item.get("status") == "available" for item in gdelt_news_evidence) else ("unavailable" if fallback_symbols else "not_requested"),
+        })
+        if any(item.get("status") == "unavailable" for item in gdelt_news_evidence):
+            source_diagnostics["gdelt_news"] = "One or more GDELT fallback requests were unavailable; retry on the next analysis."
+        if not available_recent_news:
+            source_diagnostics["news"] = "No fresh ticker-linked news was available in the prior 48 hours."
         if alpha_diagnostic:
             source_diagnostics["alpha_vantage_news"] = alpha_diagnostic
+    evidence = macro_evidence + sec_evidence + recent_news_evidence
     scores: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
     for _, row in facts.iterrows():
         item = row.to_dict()
         symbol = str(item["symbol"])
+        if "seed_memberships" in item:
+            item["seed_memberships"] = _seed_membership_list(item.get("seed_memberships"))
         fund_score, factors = fundamental_score(fundamentals.get(symbol, {}))
         technical = float(pd.to_numeric(item.get("score", 0), errors="coerce") or 0)
         combined = round(technical if fund_score is None else 0.6 * technical + 0.4 * fund_score, 2)
@@ -256,7 +408,7 @@ def research_packet(
     quality = {}
     for key, status in source_status.items():
         available = status == "available"
-        provenance = "primary" if key in {"fundamentals", "events", "macro"} else ("secondary" if key == "alpha_vantage_news" else "curated")
+        provenance = "primary" if key in {"fundamentals", "events", "macro"} else ("secondary" if key in {"news", "alpha_vantage_news", "gdelt_news"} else "curated")
         quality[key] = {"freshness": "current" if available else "unknown", "completeness": 1.0 if available else 0.0, "provenance": provenance, "conflict": "none", "score": 100 if available else 0}
     return {
         "packet_version": PROMPT_VERSION,
@@ -266,15 +418,122 @@ def research_packet(
             {"name": "local DuckDB/yfinance price cache", "fetched_at": datetime.now(timezone.utc).isoformat(), "status": "available"},
             {"name": "SEC EDGAR", "status": source_status["fundamentals"]},
             {"name": "FRED", "status": source_status["macro"]},
-            {"name": "GDELT secondary news discovery", "status": source_status["news"]},
-            {"name": "Alpha Vantage ticker-linked news", "status": source_status["alpha_vantage_news"]},
+            {"name": "Alpha Vantage primary ticker news", "status": source_status["alpha_vantage_news"]},
+            {"name": "GDELT fallback news discovery", "status": source_status["gdelt_news"]},
         ],
         "coverage": source_status, "source_quality": quality, "connector_timings_ms": connector_timings,
         "source_diagnostics": source_diagnostics, "macro": macro, "candidates": enriched,
+        "theme_breadth": normalize_theme_breadth(theme_breadth),
+        "recent_news": recent_news_payload(recent_news_evidence, news_window_start, news_window_end),
         "candidate_scores": scores, "evidence": evidence, "correlations": correlations,
         "security_master": (security_master if security_master is not None else facts)[[column for column in ["symbol", "name", "sector", "industry", "eligible", "effective_date", "source_url", "fetched_at"] if column in (security_master if security_master is not None else facts)]].to_dict(orient="records"),
         "missing_evidence_policy": "No evidence may be invented. Abstain when the packet cannot support a claim.",
     }
+
+
+def _compact_value(value: object) -> object:
+    """Remove empty values and normalize scalars for the model-facing packet."""
+    if isinstance(value, dict):
+        return {
+            str(key): compacted
+            for key, item in value.items()
+            if (compacted := _compact_value(item)) not in (None, "", [], {})
+        }
+    if isinstance(value, (list, tuple)):
+        return [compacted for item in value if (compacted := _compact_value(item)) not in (None, "", [], {})]
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, float):
+        return None if pd.isna(value) else round(value, 4)
+    if hasattr(value, "item"):
+        try:
+            return _compact_value(value.item())
+        except (TypeError, ValueError):
+            pass
+    try:
+        return None if pd.isna(value) else value
+    except (TypeError, ValueError):
+        return value
+
+
+def _compact_evidence(records: object) -> list[dict[str, object]]:
+    """Bound source evidence while keeping the complete originals in the audit packet."""
+    if not isinstance(records, list):
+        return []
+    fields = [
+        "evidence_id", "symbol", "category", "title", "summary", "publisher",
+        "published_at", "source_tier", "source_domain", "news_channel",
+        "relevance_score", "sentiment_score", "sentiment_label",
+    ]
+    counts: dict[tuple[str, str], int] = {}
+    compacted: list[dict[str, object]] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("status") != "available":
+            continue
+        category = str(record.get("category", ""))
+        if category == "macro":
+            continue
+        symbol = str(record.get("symbol", "")).upper()
+        key = (symbol, category)
+        limit = MODEL_EVIDENCE_LIMITS.get(category, 3)
+        if counts.get(key, 0) >= limit:
+            continue
+        item = {field: record.get(field) for field in fields if field in record}
+        summary = str(item.get("summary", "") or "")
+        if len(summary) > MODEL_EVIDENCE_SUMMARY_CHARS:
+            item["summary"] = summary[: MODEL_EVIDENCE_SUMMARY_CHARS - 3].rstrip() + "..."
+        cleaned = _compact_value(item)
+        if isinstance(cleaned, dict):
+            compacted.append(cleaned)
+            counts[key] = counts.get(key, 0) + 1
+    return compacted
+
+
+def compact_model_packet(packet: dict[str, object]) -> dict[str, object]:
+    """Return the bounded packet sent to GPT while preserving the full audit packet."""
+    candidate_fields = [
+        "symbol", "name", "seed_memberships", "theme", "sector", "industry",
+        "latest_close", "score", "benchmark_adjusted_score", "relative_strength_score",
+        "drawdown_52w", "extension_sma50d", "larsson_regime", "daily_trend",
+        "weekly_trend", "monthly_trend", "data_warnings", "liquidity_score",
+        "fundamental_score", "combined_score", "fundamental_factors", "entry", "correlation",
+    ]
+    candidates = []
+    for candidate in packet.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        cleaned = _compact_value({field: candidate.get(field) for field in candidate_fields if field in candidate})
+        if isinstance(cleaned, dict):
+            candidates.append(cleaned)
+
+    correlations = packet.get("correlations", {})
+    compact_correlations = {}
+    if isinstance(correlations, dict):
+        correlation_fields = [
+            "daily_window", "daily_min_observations", "weekly_window",
+            "weekly_min_observations", "candidate_summary", "high_correlation_pairs", "status",
+        ]
+        compact_correlations = {
+            field: correlations.get(field)
+            for field in correlation_fields
+            if field in correlations
+        }
+
+    model_packet = {
+        "packet_version": packet.get("packet_version"),
+        "as_of_date": packet.get("as_of_date"),
+        "benchmark": packet.get("benchmark"),
+        "coverage": packet.get("coverage", {}),
+        "source_diagnostics": packet.get("source_diagnostics", {}),
+        "macro": packet.get("macro", {}),
+        "theme_breadth": packet.get("theme_breadth", []),
+        "candidates": candidates,
+        "correlations": compact_correlations,
+        "evidence": _compact_evidence(packet.get("evidence", [])),
+        "missing_evidence_policy": packet.get("missing_evidence_policy"),
+    }
+    cleaned = _compact_value(model_packet)
+    return cleaned if isinstance(cleaned, dict) else {}
 
 
 def allowed_packet_references(packet: dict[str, object]) -> list[str]:
@@ -296,23 +555,35 @@ def allowed_packet_references(packet: dict[str, object]) -> list[str]:
         "packet:candidates.entry",
         "packet:candidates.fundamental_factors",
         "packet:correlations",
-        "packet:correlations.high_correlation_pairs",
-        "packet:correlations.daily_matrix",
     })
+    correlations = packet.get("correlations", {})
+    if isinstance(correlations, dict) and correlations.get("high_correlation_pairs"):
+        references.add("packet:correlations.high_correlation_pairs")
+    if isinstance(correlations, dict) and correlations.get("daily_matrix"):
+        references.add("packet:correlations.daily_matrix")
+    for breadth in packet.get("theme_breadth", []):
+        if isinstance(breadth, dict) and breadth.get("reference"):
+            references.add(str(breadth["reference"]))
     for candidate in packet.get("candidates", []):
         if not isinstance(candidate, dict) or not candidate.get("symbol"):
             continue
         symbol = str(candidate["symbol"]).upper()
         references.add(f"packet:candidates:{symbol}")
-        references.add(f"packet:correlations.daily_matrix.{symbol}")
+        if isinstance(correlations, dict) and correlations.get("daily_matrix"):
+            references.add(f"packet:correlations.daily_matrix.{symbol}")
     return sorted(references)
 
 
 def prompt_for_packet(packet: dict[str, object], config: LabConfig) -> str:
-    allowed_references = allowed_packet_references(packet)
+    model_packet = compact_model_packet(packet)
+    allowed_references = allowed_packet_references(model_packet)
     return f"""You are Chatgptfolio's research underwriter. Use ONLY the timestamped research packet below. Do not invent news, fundamentals, prices, citations, targets, or events. This is paper-trading research, not investment advice. Prefer abstaining when evidence is insufficient.
 
 Choose at most {config.max_holdings} liquid US equity/ETF symbols already in the packet. Long only; no options, leverage, shorts, or symbols outside the packet. The deterministic allocator—not you—sets final position sizes. Give each candidate an integer conviction from 0 to 100 and cite evidence IDs from the packet. Treat the packet's correlation data as a diversification preference: avoid redundant high-correlation combinations when conviction is comparable. Explain downside triggers and bull/base/bear valuation scenarios. Classify every investment risk as critical, high, medium, low, or unresolved. Every risk-flag evidence reference must exactly match one item in ALLOWED_EVIDENCE_REFERENCES below; return an empty array when no permitted citation supports the risk. Do NOT return entry prices, targets, stops, or valuation levels: the UI attaches deterministic price guidance from the packet. Cash target is a preference only and must be between 0 and 0.50. Active portfolio limits: max position {config.max_position:.1%}; sector cap {config.max_sector_exposure:.1%}; turnover budget {config.max_turnover:.1%}.
+
+THEME_BREADTH_POLICY: `theme_breadth` is advisory context. Strong participation may support a thesis and deteriorating participation may support a risk, but breadth must never automatically exclude a candidate or determine position size. Treat `Unresolved` confirmations or coverage below 75% as insufficient breadth evidence. Use each candidate's `seed_memberships` to connect it to one or more seed snapshots.
+
+RECENT_NEWS_POLICY: News evidence contains only the prior 48 hours of ticker-linked Alpha Vantage news, ranked by per-ticker relevance and sentiment strength, plus GDELT fallback articles only when Alpha Vantage had no fresh coverage for that symbol. Relevance and sentiment are evidence inputs, never automatic buy/sell instructions. Assess materiality yourself alongside source quality, technicals, fundamentals, breadth, and risks; ignore weak, irrelevant, or conflicting articles. If news materially informs a thesis, catalyst, or risk, include its evidence ID in that holding's `evidence_refs` or the relevant risk flag.
 
 Return JSON matching the requested schema.
 
@@ -320,7 +591,7 @@ ALLOWED_EVIDENCE_REFERENCES:
 {json.dumps(allowed_references)}
 
 RESEARCH_PACKET:
-{json.dumps(packet, sort_keys=True, default=str)}"""
+{json.dumps(model_packet, sort_keys=True, default=str, separators=(",", ":"))}"""
 
 
 DECISION_SCHEMA: dict[str, Any] = {
@@ -338,7 +609,7 @@ DECISION_SCHEMA: dict[str, Any] = {
 def decision_schema_for_packet(packet: dict[str, object]) -> dict[str, Any]:
     """Constrain structured risk citations to the current immutable packet."""
     schema = json.loads(json.dumps(DECISION_SCHEMA))
-    references = allowed_packet_references(packet) or [""]
+    references = allowed_packet_references(compact_model_packet(packet)) or [""]
     reference_schema = {"type": "string", "enum": references}
     risk_reference_items = [
         schema["properties"]["portfolio_risks"]["items"],
@@ -352,7 +623,7 @@ def decision_schema_for_packet(packet: dict[str, object]) -> dict[str, Any]:
 def evidence_health(packet: dict[str, object]) -> list[dict[str, str]]:
     """Classify evidence completeness deterministically for the UI and audit trail."""
     coverage = packet.get("coverage", {}) if isinstance(packet, dict) else {}
-    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "GDELT news discovery", "alpha_vantage_news": "Alpha Vantage news"}
+    labels = {"prices": "Price history", "fundamentals": "SEC fundamentals", "events": "SEC filings", "macro": "FRED macro", "news": "Recent ticker news", "alpha_vantage_news": "Alpha Vantage primary news", "gdelt_news": "GDELT fallback news"}
     output = []
     for key, label in labels.items():
         status = str(coverage.get(key, "unresolved"))
@@ -370,13 +641,38 @@ def severity_counts(items: list[dict[str, object]]) -> dict[str, int]:
     return {severity: sum(1 for item in items if item.get("severity") == severity) for severity in SEVERITY_ORDER}
 
 
+def response_usage_metadata(response: object) -> dict[str, int]:
+    """Normalize Responses API token accounting without depending on SDK internals."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+
+    def value(source: object, key: str) -> int:
+        raw = source.get(key, 0) if isinstance(source, dict) else getattr(source, key, 0)
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_details = usage.get("input_tokens_details", {}) if isinstance(usage, dict) else getattr(usage, "input_tokens_details", {})
+    output_details = usage.get("output_tokens_details", {}) if isinstance(usage, dict) else getattr(usage, "output_tokens_details", {})
+    return {
+        "input_tokens": value(usage, "input_tokens"),
+        "cached_input_tokens": value(input_details, "cached_tokens"),
+        "cache_write_input_tokens": value(input_details, "cache_write_tokens"),
+        "output_tokens": value(usage, "output_tokens"),
+        "reasoning_tokens": value(output_details, "reasoning_tokens"),
+        "total_tokens": value(usage, "total_tokens"),
+    }
+
+
 class OpenAIPortfolioModel:
     def __init__(self, model: str) -> None:
         if model not in MODEL_OPTIONS:
             raise ValueError(f"Unsupported model: {model}")
         self.model = model
 
-    def decide(self, packet: dict[str, object], config: LabConfig) -> tuple[dict[str, object], str, str]:
+    def decide(self, packet: dict[str, object], config: LabConfig) -> tuple[dict[str, object], str, str, dict[str, int]]:
         api_key = openai_api_key()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not configured and no Chatgptfolio key was found in macOS Keychain. Add it to your environment or save it with: security add-generic-password -a \"$USER\" -s chatgptfolio-openai -w")
@@ -394,7 +690,7 @@ class OpenAIPortfolioModel:
         raw = response.output_text
         decision = json.loads(raw)
         returned_model = getattr(response, "model", self.model)
-        return decision, raw, returned_model
+        return decision, raw, returned_model, response_usage_metadata(response)
 
 
 def openai_api_key() -> str | None:
@@ -410,7 +706,7 @@ def openai_api_key() -> str | None:
         return None
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-a", getpass.getuser(), "-s", "chatgptfolio-openai", "-w"],
+            ["/usr/bin/security", "find-generic-password", "-a", getpass.getuser(), "-s", "chatgptfolio-openai", "-w"],
             check=False,
             capture_output=True,
             text=True,
@@ -523,7 +819,7 @@ def validate_decision(decision: dict[str, object], candidates: pd.DataFrame, con
         if turnover > config.max_turnover + 1e-8:
             errors.append("turnover violates limit")
     if packet is not None:
-        evidence_ids = set(allowed_packet_references(packet))
+        evidence_ids = set(allowed_packet_references(compact_model_packet(packet)))
         flags = list(decision.get("portfolio_risks", []))
         for item in holdings:
             if isinstance(item, dict):

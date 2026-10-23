@@ -10,10 +10,12 @@ The `Chatgptfolio Lab` dashboard view adds an auditable paper-trading workflow u
 
 - Default decision model: `gpt-5.5`; selectable alternatives: `gpt-5.4`, `gpt-5.4-mini`.
 - Set `OPENAI_API_KEY` in your environment before running a model analysis. On macOS, the app also automatically reads a Keychain entry named `chatgptfolio-openai` for the current user. The application never writes API keys to DuckDB, logs, snapshots, or source control.
-- Optional Alpha Vantage news enrichment reads `ALPHA_VANTAGE_API_KEY` from the environment or the macOS Keychain entry `chatgptfolio-alpha-vantage`. It makes one bounded multi-ticker news request per research refresh, stores only public evidence URLs, and never stores the credential.
+- Alpha Vantage is the primary recent-news source when `ALPHA_VANTAGE_API_KEY` is available in the environment or macOS Keychain entry `chatgptfolio-alpha-vantage`. Each Lab analysis makes one bounded 48-hour multi-ticker request, ranks ticker-linked articles by relevance and sentiment strength, stores only public evidence URLs, and never stores the credential. GDELT supplies fallback discovery only for symbols without fresh Alpha Vantage coverage.
 - Research packets, model configuration, raw structured responses, validation results, evidence, factor scores, and paper orders are persisted locally for audit.
-- The weekly research packet can enrich technical candidates with bounded, timestamped SEC/EDGAR filings and facts, FRED macro observations, and curated news RSS. Missing or failed sources remain explicit; the model is instructed to abstain rather than fabricate evidence.
+- The research packet can enrich technical candidates with bounded, timestamped SEC/EDGAR filings and facts, FRED macro observations, 48-hour ticker news, and the latest advisory breadth snapshot for every fixed seed universe. The complete packet remains frozen for audit while a compact, de-duplicated view is sent to the model; missing or failed sources remain explicit.
 - Model outputs express conviction and underwriting only. A deterministic allocator applies the holding, position, sector, turnover, and cash constraints before any paper order can be approved.
+- Every approved run creates a separate $100,000 paper experiment. Experiments never share capital, positions, fills, NAV, or benchmark history; approvals are not rebalances of any existing experiment.
+- Pending approvals fill independently at the first cached opening price after their frozen research date. The Paper Portfolio view compares normalized experiments, their available SPY/QQQ/GLD/BTC-USD/TECHNICAL baselines, and each experiment's own fill and audit trail.
 
 ### Weekly packet CLI
 
@@ -100,6 +102,8 @@ Built-in presets:
 - `Crypto Universe`: public crypto and blockchain equities, not crypto assets like `BTC-USD`.
 - `Quantum Universe`: quantum pure plays, quantum security, quantum platforms, and enabling semiconductor/software suppliers.
 - `Cybersecurity Universe`: security platforms, endpoint, identity, zero trust, vulnerability management, data resilience, and cyber services.
+- `Magnificent Seven Universe`: Apple, Microsoft, Alphabet, Amazon, NVIDIA, Meta, and Tesla.
+- `Space Exploration Universe`: listed launch, lunar-services, space-infrastructure, Earth-observation, satellite-communications, and mission-systems companies. SpaceX is not included because it is private.
 
 The ticker text area is prefilled from the selected preset and is the active watchlist. Removing a ticker removes it from the current run; adding an unknown ticker marks it as `Manual` while preserving seed metadata for preset tickers.
 

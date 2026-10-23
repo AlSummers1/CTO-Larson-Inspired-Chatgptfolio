@@ -13,7 +13,6 @@ from stockpicker.data import (
     approve_paper_rebalance,
     cached_symbol_count,
     DEFAULT_DB_PATH,
-    default_paper_portfolio,
     execute_pending_paper_rebalances,
     fetch_price_history,
     latest_cache_timestamp,
@@ -22,16 +21,12 @@ from stockpicker.data import (
     load_matching_portfolio_snapshot,
     load_portfolio_rebalance_log,
     load_lab_runs,
-    load_paper_benchmarks,
+    load_paper_experiments,
+    load_paper_fills,
     load_paper_portfolio_dashboard,
-    load_paper_nav,
-    load_paper_positions,
-    load_paper_rebalances,
     load_source_health,
-    paper_portfolio_weights,
     paper_valuation_symbols,
     rebuild_paper_nav,
-    save_lab_paper_orders,
     save_lab_research_snapshot,
     save_lab_research_details,
     save_lab_run,
@@ -43,6 +38,7 @@ from stockpicker.portfolio import (
     allocate_portfolio,
     apply_sensitivity_to_target,
     build_portfolio_candidates,
+    cash_target_for_regime,
     compare_portfolios,
     canonical_selected_seeds,
     portfolio_snapshot_metadata,
@@ -71,13 +67,16 @@ from stockpicker.lab import (
     SEVERITY_COLORS,
     SEVERITY_ORDER,
     config_payload as lab_config_payload,
+    compact_model_packet,
     credential_status,
     decision_hash,
+    decision_schema_for_packet,
     evidence_health,
     paper_orders,
     optimize_decision,
     packet_context_metadata,
     preflight_packet,
+    prompt_for_packet,
     research_packet,
     severity_counts,
     validate_decision,
@@ -101,7 +100,29 @@ SEED_UNIVERSES: dict[str, Path | None] = {
     "Crypto Universe": PROJECT_ROOT / "data" / "universe_crypto.csv",
     "Quantum Universe": PROJECT_ROOT / "data" / "universe_quantum.csv",
     "Cybersecurity Universe": PROJECT_ROOT / "data" / "universe_cybersecurity.csv",
+    "Magnificent Seven Universe": PROJECT_ROOT / "data" / "universe_magnificent_seven.csv",
+    "Space Exploration Universe": PROJECT_ROOT / "data" / "universe_space_exploration.csv",
     MANUAL_ONLY_UNIVERSE: None,
+}
+SEED_UNIVERSE_DISPLAY_NAMES = {
+    "SMH Universe": "Semiconductors (SMH)",
+    "Healthcare Universe": "Healthcare",
+    "GLP-1 and Obesity Universe": "GLP-1 & Obesity",
+    "Defence and Space Universe": "Defence & Space",
+    "Data Center Infrastructure Universe": "Data Center Infra",
+    "Power Grid and Electrification Universe": "Power Grid",
+    "Utilities Universe": "Utilities",
+    "Clean Energy Universe": "Clean Energy",
+    "Nuclear Energy Universe": "Nuclear Energy",
+    "Rare Earths and Strategic Materials Universe": "Rare Earths & Materials",
+    "Crypto Universe": "Crypto",
+    "Quantum Universe": "Quantum",
+    "Cybersecurity Universe": "Cybersecurity",
+    "Magnificent Seven Universe": "Mag7",
+    "Space Exploration Universe": "Space Exploration",
+}
+LEGACY_SEED_UNIVERSE_NAMES = {
+    "Magnificent Seven + SpaceX Universe": "Magnificent Seven Universe",
 }
 RRG_COLORS = {
     "Leading": "#16a34a",
@@ -127,7 +148,18 @@ DEFAULT_RRG_SEED_UNIVERSES = [
     "Cybersecurity Universe",
 ]
 DEFAULT_PORTFOLIO_SEED_UNIVERSES = DEFAULT_RRG_SEED_UNIVERSES
-VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Portfolio", "Chatgptfolio Lab", "Paper Portfolio", "System Health", "Data Audit"]
+VIEW_OPTIONS = ["Rankings", "Detail", "Benchmark", "RRG", "Theme Breadth", "Portfolio", "Chatgptfolio Lab", "Paper Portfolio", "System Health", "Data Audit"]
+THEME_BREADTH_SMA_DAYS = 20
+THEME_BREADTH_SMOOTHING_WEEKS = 4
+THEME_BREADTH_ROC_DAYS = 50
+THEME_BREADTH_MIN_COVERAGE = 0.75
+THEME_BREADTH_PERCENT_COLUMNS = (
+    "breadth",
+    "breadth_4w_average",
+    "breadth_change",
+    "roc_50d",
+    "coverage",
+)
 RRG_CONTROL_HELP = {
     "tail_weeks": "How many recent weekly RRG points to draw as each ticker's rotation trail.",
     "ratio_smoothing": "Weeks used to smooth the stock-vs-benchmark relative trend. Higher values make the RS Ratio less jumpy.",
@@ -180,7 +212,13 @@ def cached_prices(
     years: int,
     db_path: str,
 ) -> pd.DataFrame:
-    return fetch_price_history(list(symbols), refresh=refresh, years=years, db_path=Path(db_path))
+    return fetch_price_history(
+        list(symbols),
+        refresh=refresh,
+        years=years,
+        db_path=Path(db_path),
+        download_missing=refresh,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -238,6 +276,80 @@ def cached_rrg_basket_history(
     )
 
 
+@st.cache_data(show_spinner=False)
+def cached_theme_breadth_history(
+    prices: pd.DataFrame,
+    symbols: tuple[str, ...],
+    sma_days: int = THEME_BREADTH_SMA_DAYS,
+    smoothing_weeks: int = THEME_BREADTH_SMOOTHING_WEEKS,
+    roc_days: int = THEME_BREADTH_ROC_DAYS,
+) -> pd.DataFrame:
+    """Return weekly 20D breadth and daily-rebalanced equal-weight ROC from local prices."""
+    columns = [
+        "date",
+        "breadth",
+        "breadth_4w_average",
+        "breadth_change",
+        "eligible_count",
+        "universe_size",
+        "coverage",
+        "theme_index",
+        "roc_50d",
+        "return_coverage",
+        "roc_min_coverage",
+    ]
+    requested = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()))
+    if not requested or prices.empty or not {"symbol", "date", "close"}.issubset(prices.columns):
+        return pd.DataFrame(columns=columns)
+
+    frame = prices.loc[prices["symbol"].astype(str).str.upper().isin(requested), ["date", "symbol", "close"]].copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["date", "symbol", "close"])
+    frame = frame[frame["close"].gt(0)].drop_duplicates(["date", "symbol"], keep="last")
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    frame = frame.sort_values(["symbol", "date"])
+    frame["average"] = frame.groupby("symbol", sort=False)["close"].transform(
+        lambda values: values.rolling(window=sma_days, min_periods=sma_days).mean()
+    )
+    close = frame.pivot(index="date", columns="symbol", values="close").sort_index().reindex(columns=requested)
+    average = frame.pivot(index="date", columns="symbol", values="average").sort_index().reindex(columns=requested)
+    eligible = close.notna() & average.notna()
+    above_average = (close > average).where(eligible)
+    weekly_eligible = eligible.resample("W-FRI").last().fillna(False)
+    # Resampler.last() skips nulls by default. Without replacing them first, a
+    # constituent missing on the final weekly observation can retain an earlier
+    # True value in the numerator while being absent from the eligible
+    # denominator, producing impossible breadth readings above 100%.
+    weekly_above = above_average.eq(True).resample("W-FRI").last() & weekly_eligible
+    weekly = pd.DataFrame(index=weekly_eligible.index)
+    weekly["eligible_count"] = weekly_eligible.sum(axis=1).astype(int)
+    weekly["universe_size"] = len(requested)
+    weekly["coverage"] = weekly["eligible_count"] / weekly["universe_size"]
+    weekly["breadth"] = weekly_above.sum(axis=1, skipna=True) / weekly["eligible_count"].replace(0, float("nan"))
+    weekly["breadth_4w_average"] = weekly["breadth"].rolling(smoothing_weeks, min_periods=smoothing_weeks).mean()
+    weekly["breadth_change"] = weekly["breadth"].diff()
+
+    returns = close.pct_change(fill_method=None).replace([float("inf"), float("-inf")], float("nan"))
+    daily_return = returns.mean(axis=1, skipna=True)
+    return_coverage = returns.notna().sum(axis=1) / len(requested)
+    theme_index = (1.0 + daily_return.fillna(0.0)).cumprod()
+    daily = pd.DataFrame(
+        {
+            "theme_index": theme_index,
+            "roc_50d": theme_index.pct_change(roc_days, fill_method=None),
+            "return_coverage": return_coverage,
+            "roc_min_coverage": return_coverage.rolling(roc_days, min_periods=roc_days).min(),
+        }
+    )
+    weekly = weekly.join(daily.resample("W-FRI").last(), how="left")
+    weekly = weekly[weekly["eligible_count"].gt(0)].reset_index(names="date")
+    return weekly[columns]
+
+
 def empty_universe() -> pd.DataFrame:
     return pd.DataFrame(columns=UNIVERSE_COLUMNS)
 
@@ -246,18 +358,57 @@ def seed_universe_options() -> list[str]:
     return list(SEED_UNIVERSES)
 
 
+def seed_universe_display_name(seed_label: str) -> str:
+    """Keep the compact sidebar selector readable without changing stored labels."""
+    return SEED_UNIVERSE_DISPLAY_NAMES.get(seed_label, seed_label)
+
+
+def seed_universe_label_after_migration(current_label: object, options: list[str]) -> str:
+    """Migrate a previously selected seed to its current, available label."""
+    candidate = LEGACY_SEED_UNIVERSE_NAMES.get(str(current_label), str(current_label))
+    return candidate if candidate in options else DEFAULT_SEED_UNIVERSE
+
+
+def benchmark_regime_cash_rule_status(regime: str, enabled: bool) -> str:
+    """Describe the exact regime-driven cash reserve applied to the allocator."""
+    reserve = cash_target_for_regime(regime, enabled)
+    if not enabled:
+        return f"Regime cash rule is off — {regime} benchmark reserve: 0%."
+    return f"Regime cash rule is on — {regime} benchmark reserve: {reserve:.0%}."
+
+
 def seed_rrg_universe_options() -> list[str]:
     return [label for label, path in SEED_UNIVERSES.items() if path is not None]
 
 
 def default_rrg_seed_universes() -> list[str]:
-    options = seed_rrg_universe_options()
-    return [label for label in DEFAULT_RRG_SEED_UNIVERSES if label in options]
+    return seed_rrg_universe_options()
+
+
+def rrg_seed_universes_after_default_migration(current_labels: object, options: list[str]) -> list[str]:
+    """Move sessions with the old curated default to the current all-seeds default."""
+    if not isinstance(current_labels, list):
+        return options.copy()
+    valid_current = [label for label in current_labels if label in options]
+    legacy_default = [label for label in DEFAULT_RRG_SEED_UNIVERSES if label in options]
+    if valid_current == legacy_default and set(valid_current) != set(options):
+        return options.copy()
+    return valid_current
 
 
 def default_portfolio_seed_universes() -> list[str]:
-    options = seed_rrg_universe_options()
-    return [label for label in DEFAULT_PORTFOLIO_SEED_UNIVERSES if label in options]
+    return seed_rrg_universe_options()
+
+
+def portfolio_seed_universes_after_default_migration(current_labels: object, options: list[str]) -> list[str]:
+    """Expand the old four-seed default while preserving custom selections."""
+    if not isinstance(current_labels, list):
+        return options.copy()
+    valid_current = [label for label in current_labels if label in options]
+    legacy_default = [label for label in DEFAULT_PORTFOLIO_SEED_UNIVERSES if label in options]
+    if valid_current == legacy_default and set(valid_current) != set(options):
+        return options.copy()
+    return valid_current
 
 
 def select_seed_universe(seed_label: str, seed_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -365,6 +516,132 @@ def all_seed_universe(seed_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(rows)[[*UNIVERSE_COLUMNS, "seed_memberships"]]
 
 
+def theme_breadth_confirmation(summary: pd.Series | dict[str, object]) -> str:
+    """Classify agreement between participation and 50-session theme momentum."""
+    getter = summary.get if hasattr(summary, "get") else lambda _key, default=None: default
+    breadth = pd.to_numeric(pd.Series([getter("breadth", None)]), errors="coerce").iloc[0]
+    average = pd.to_numeric(pd.Series([getter("breadth_4w_average", None)]), errors="coerce").iloc[0]
+    roc = pd.to_numeric(pd.Series([getter("roc_50d", None)]), errors="coerce").iloc[0]
+    coverage = pd.to_numeric(pd.Series([getter("coverage", None)]), errors="coerce").iloc[0]
+    roc_coverage = pd.to_numeric(pd.Series([getter("roc_min_coverage", None)]), errors="coerce").iloc[0]
+    if (
+        pd.isna(breadth)
+        or pd.isna(average)
+        or pd.isna(roc)
+        or pd.isna(coverage)
+        or pd.isna(roc_coverage)
+        or coverage < THEME_BREADTH_MIN_COVERAGE
+        or roc_coverage < THEME_BREADTH_MIN_COVERAGE
+    ):
+        return "Unresolved"
+    if breadth > average and roc > 0:
+        return "Confirmed advance"
+    if breadth < average and roc < 0:
+        return "Confirmed deterioration"
+    return "Mixed"
+
+
+def latest_theme_breadth_summary(
+    history: pd.DataFrame,
+    seed_name: str,
+    universe_size: int | None = None,
+) -> pd.DataFrame:
+    """Return the latest transparent breadth/ROC record for one built-in seed universe."""
+    columns = [
+        "seed_universe",
+        "date",
+        "breadth",
+        "breadth_4w_average",
+        "breadth_change",
+        "roc_50d",
+        "coverage",
+        "eligible_count",
+        "universe_size",
+        "missing_or_short_history",
+        "confirmation",
+    ]
+    if history.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "seed_universe": seed_name,
+                    "universe_size": int(universe_size or 0),
+                    "missing_or_short_history": int(universe_size or 0),
+                    "confirmation": "Unresolved",
+                }
+            ],
+            columns=columns,
+        )
+    latest = history.sort_values("date").tail(1).copy()
+    latest.insert(0, "seed_universe", seed_name)
+    latest["missing_or_short_history"] = latest["universe_size"] - latest["eligible_count"]
+    latest["confirmation"] = latest.apply(theme_breadth_confirmation, axis=1)
+    return latest[[column for column in columns if column in latest.columns]]
+
+
+def theme_breadth_packet_rows(
+    prices: pd.DataFrame,
+    seed_frames: dict[str, pd.DataFrame],
+    as_of_date: date,
+) -> list[dict[str, object]]:
+    """Build latest point-in-time breadth snapshots for every fixed seed universe."""
+    cutoff = pd.Timestamp(as_of_date).normalize()
+    snapshots: list[dict[str, object]] = []
+    for label in seed_rrg_universe_options():
+        theme_symbols = seed_symbols_for_labels(seed_frames, [label])
+        theme_prices = prices_for_symbols(prices, set(theme_symbols))
+        if not theme_prices.empty and "date" in theme_prices:
+            observed_dates = pd.to_datetime(theme_prices["date"], errors="coerce").dt.normalize()
+            theme_prices = theme_prices.loc[observed_dates.le(cutoff)].copy()
+            observed_dates = observed_dates.loc[observed_dates.le(cutoff)].dropna()
+            observation_date = observed_dates.max().date().isoformat() if not observed_dates.empty else None
+        else:
+            observation_date = None
+        history = cached_theme_breadth_history(theme_prices, tuple(theme_symbols))
+        summary = latest_theme_breadth_summary(history, label, len(theme_symbols)).iloc[0].to_dict()
+        summary["observation_date"] = observation_date
+        snapshots.append(summary)
+    return snapshots
+
+
+def theme_breadth_chart(history: pd.DataFrame, seed_name: str) -> go.Figure:
+    """Draw weekly percentage-above-20D breadth with its four-week average."""
+    fig = go.Figure()
+    if history.empty:
+        fig.update_layout(title=f"{seed_universe_display_name(seed_name)} breadth", height=360)
+        return fig
+    fig.add_trace(go.Scatter(x=history["date"], y=history["breadth"], mode="lines+markers", name="% above 20D"))
+    fig.add_trace(go.Scatter(x=history["date"], y=history["breadth_4w_average"], mode="lines", name="4W average"))
+    fig.update_layout(
+        title=f"{seed_universe_display_name(seed_name)}: % above 20D SMA",
+        yaxis_title="Participation",
+        yaxis={"tickformat": ".0%", "range": [0, 1]},
+        xaxis_title="",
+        height=360,
+        margin={"l": 10, "r": 10, "t": 50, "b": 10},
+    )
+    return fig
+
+
+def theme_roc_chart(history: pd.DataFrame, seed_name: str) -> go.Figure:
+    """Draw 50-session ROC of the locally constructed equal-weight theme index."""
+    fig = go.Figure()
+    if history.empty:
+        fig.update_layout(title=f"{seed_universe_display_name(seed_name)} 50D ROC", height=360)
+        return fig
+    fig.add_trace(go.Scatter(x=history["date"], y=history["roc_50d"], mode="lines", name="50D ROC"))
+    fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+    fig.update_layout(
+        title=f"{seed_universe_display_name(seed_name)}: equal-weight theme index 50D ROC",
+        yaxis_title="Rate of change",
+        yaxis={"tickformat": ".0%"},
+        xaxis_title="",
+        height=360,
+        margin={"l": 10, "r": 10, "t": 50, "b": 10},
+    )
+    return fig
+
+
 def severity_dot_strip(items: list[dict[str, object]], label: str) -> None:
     counts = severity_counts(items)
     dots = " ".join(f"<span style='color:{SEVERITY_COLORS[level]};font-size:1.35rem'>●</span>" * counts[level] for level in SEVERITY_ORDER)
@@ -389,6 +666,308 @@ def money(value: object) -> str:
     if pd.isna(number):
         return "n/a"
     return f"${float(number):,.2f}"
+
+
+def normalize_paper_series(series: pd.DataFrame, value_column: str = "nav", start_value: float = 100_000.0) -> pd.DataFrame:
+    """Normalize one experiment or benchmark series to its own nominal start."""
+    if series.empty or value_column not in series:
+        return pd.DataFrame(columns=[*series.columns, "normalized_nav"])
+    normalized = series.dropna(subset=[value_column]).sort_values("date").copy()
+    if normalized.empty or float(normalized.iloc[0][value_column]) == 0:
+        normalized["normalized_nav"] = float("nan")
+        return normalized
+    normalized["normalized_nav"] = start_value * normalized[value_column] / float(normalized.iloc[0][value_column])
+    return normalized
+
+
+SHARED_MARKET_BENCHMARKS = ("SPY", "QQQ", "GLD", "BTC-USD")
+RRG_REGIME_ORDER = ("Leading", "Improving", "Weakening", "Lagging", "Unresolved")
+RRG_STRENGTH_QUADRANTS = {"Leading", "Improving"}
+RRG_WEAKNESS_QUADRANTS = {"Weakening", "Lagging"}
+
+
+def paper_chart_trace_visibility(symbol: object) -> bool | str:
+    """Start broad market references hidden while keeping run-specific traces visible."""
+    return "legendonly" if str(symbol).upper() in SHARED_MARKET_BENCHMARKS else True
+
+
+def paper_experiment_display_name(experiment: pd.Series | dict[str, object]) -> str:
+    """Return a descriptive UI label while leaving the immutable run name intact."""
+    getter = experiment.get if hasattr(experiment, "get") else lambda _key, default=None: default
+    base_name = str(getter("name", "Experiment"))
+    sensitivity = str(getter("sensitivity", "Balanced") or "Balanced")
+    basket_description = str(getter("basket_description", "Long selected equities") or "Long selected equities")
+    return f"{base_name} — {sensitivity} — {basket_description}"
+
+
+def paper_comparison_benchmark_anchor(experiments: pd.DataFrame) -> int | None:
+    """Return the earliest filled selected experiment for shared market references."""
+    if experiments.empty or not {"portfolio_id", "fill_date"}.issubset(experiments.columns):
+        return None
+    filled = experiments.copy()
+    filled["fill_date"] = pd.to_datetime(filled["fill_date"], errors="coerce")
+    filled = filled.dropna(subset=["fill_date"]).sort_values(["fill_date", "portfolio_id"])
+    return int(filled.iloc[0]["portfolio_id"]) if not filled.empty else None
+
+
+def shared_market_benchmark_series(benchmarks: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Normalize the one shared market-reference set; TECHNICAL stays run-specific."""
+    if benchmarks.empty or not {"symbol", "date", "nav"}.issubset(benchmarks.columns):
+        return {}
+    output: dict[str, pd.DataFrame] = {}
+    normalized_symbols = benchmarks["symbol"].astype(str).str.upper()
+    for symbol in SHARED_MARKET_BENCHMARKS:
+        normalized = normalize_paper_series(benchmarks.loc[normalized_symbols == symbol])
+        if not normalized.empty:
+            output[symbol] = normalized
+    return output
+
+
+def paper_comparison_start_warning(experiments: pd.DataFrame) -> str | None:
+    """Explain when selected experiments do not share a comparable start date."""
+    if experiments.empty or "fill_date" not in experiments:
+        return None
+    starts = pd.to_datetime(experiments["fill_date"], errors="coerce").dropna().dt.date.unique()
+    if len(starts) > 1:
+        return "Selected experiments have different start dates. Each series is normalized to $100,000 at its own start, so the comparison is not directly like-for-like."
+    return None
+
+
+def paper_holding_display_frame(
+    positions: pd.DataFrame,
+    prices: pd.DataFrame,
+    seed_metadata: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build ticker/name display rows with local cached valuation for filled paper holdings."""
+    columns = ["symbol", "name", "label", "shares", "average_cost", "latest_close", "value", "weight"]
+    if positions.empty or "symbol" not in positions:
+        return pd.DataFrame(columns=columns)
+
+    holdings = positions.copy()
+    holdings["symbol"] = holdings["symbol"].astype(str).str.strip().str.upper()
+    holdings["shares"] = pd.to_numeric(holdings.get("shares"), errors="coerce").fillna(0.0)
+    holdings["average_cost"] = pd.to_numeric(holdings.get("average_cost"), errors="coerce")
+    holdings = holdings[holdings["symbol"].ne("") & holdings["shares"].gt(0)].copy()
+    if holdings.empty:
+        return pd.DataFrame(columns=columns)
+
+    if prices.empty or not {"symbol", "date", "close"}.issubset(prices.columns):
+        latest = pd.DataFrame(columns=["symbol", "latest_close"])
+    else:
+        latest = prices.copy()
+        latest["symbol"] = latest["symbol"].astype(str).str.strip().str.upper()
+        latest["date"] = pd.to_datetime(latest["date"], errors="coerce")
+        latest["close"] = pd.to_numeric(latest["close"], errors="coerce")
+        latest = (
+            latest[latest["symbol"].isin(holdings["symbol"])]
+            .dropna(subset=["date", "close"])
+            .sort_values(["symbol", "date"])
+            .groupby("symbol", as_index=False)
+            .tail(1)[["symbol", "close"]]
+            .rename(columns={"close": "latest_close"})
+        )
+
+    if seed_metadata.empty or not {"symbol", "name"}.issubset(seed_metadata.columns):
+        names = pd.DataFrame(columns=["symbol", "name"])
+    else:
+        names = seed_metadata[["symbol", "name"]].copy()
+        names["symbol"] = names["symbol"].astype(str).str.strip().str.upper()
+        names["name"] = names["name"].fillna("").astype(str).str.strip()
+        names = names.drop_duplicates("symbol", keep="first")
+
+    display = holdings.merge(latest, on="symbol", how="left").merge(names, on="symbol", how="left")
+    display["name"] = display["name"].fillna("").astype(str).str.strip()
+    display.loc[display["name"].eq(""), "name"] = display.loc[display["name"].eq(""), "symbol"]
+    display["valuation_price"] = display["latest_close"].where(display["latest_close"].notna(), display["average_cost"])
+    display["value"] = display["shares"] * display["valuation_price"]
+    display["value"] = pd.to_numeric(display["value"], errors="coerce").fillna(0.0)
+    total_value = float(display["value"].sum())
+    display["weight"] = display["value"] / total_value if total_value > 0 else 0.0
+    display["label"] = [
+        symbol if name == symbol else f"{symbol} — {name}"
+        for symbol, name in zip(display["symbol"], display["name"])
+    ]
+    return display[columns].sort_values("value", ascending=False).reset_index(drop=True)
+
+
+def paper_value_pie_chart(values: pd.DataFrame, label_column: str, value_column: str, title: str) -> go.Figure:
+    """Render a donut chart from already-valued paper holdings or exposures."""
+    fig = go.Figure()
+    if values.empty or label_column not in values.columns or value_column not in values.columns:
+        fig.update_layout(title=title, height=360)
+        return fig
+    chart_values = values.copy()
+    chart_values[value_column] = pd.to_numeric(chart_values[value_column], errors="coerce").fillna(0.0)
+    if float(chart_values[value_column].sum()) <= 0:
+        fig.update_layout(title=title, height=360)
+        return fig
+    fig.add_trace(
+        go.Pie(
+            labels=chart_values[label_column],
+            values=chart_values[value_column],
+            hole=0.45,
+            textinfo="label+percent",
+            hovertemplate="%{label}<br>%{value:$,.2f}<br>%{percent}<extra></extra>",
+        )
+    )
+    fig.update_layout(title=title, height=360, margin={"l": 10, "r": 10, "t": 50, "b": 10})
+    return fig
+
+
+def paper_rrg_snapshot(
+    prices: pd.DataFrame,
+    symbols: list[str],
+    benchmark: str,
+    as_of_date: object | None = None,
+) -> pd.DataFrame:
+    """Classify current paper holdings using the app's stock-level weekly RRG engine."""
+    requested = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols if str(symbol).strip()))
+    columns = ["symbol", "rrg_date", "rrg_quadrant"]
+    if not requested:
+        return pd.DataFrame(columns=columns)
+
+    if prices.empty or not {"symbol", "date", "close"}.issubset(prices.columns):
+        return pd.DataFrame({"symbol": requested, "rrg_date": pd.NaT, "rrg_quadrant": "Unresolved"})
+
+    scoped_prices = prices.copy()
+    scoped_prices["symbol"] = scoped_prices["symbol"].astype(str).str.strip().str.upper()
+    scoped_prices["date"] = pd.to_datetime(scoped_prices["date"], errors="coerce")
+    if as_of_date is not None:
+        scoped_prices = scoped_prices[scoped_prices["date"].le(pd.to_datetime(as_of_date))]
+
+    history = compute_rrg_history(
+        scoped_prices,
+        requested,
+        benchmark,
+        RRGConfig(ratio_window_weeks=10, momentum_window_weeks=10, tail_weeks=1),
+    )
+    if history.empty:
+        latest = pd.DataFrame(columns=["symbol", "date", "quadrant"])
+    else:
+        latest = history.sort_values(["symbol", "date"]).groupby("symbol", as_index=False).tail(1)
+
+    snapshot = pd.DataFrame({"symbol": requested}).merge(
+        latest[["symbol", "date", "quadrant"]],
+        on="symbol",
+        how="left",
+    )
+    snapshot["rrg_date"] = pd.to_datetime(snapshot["date"], errors="coerce")
+    snapshot["rrg_quadrant"] = snapshot["quadrant"].fillna("Unresolved")
+    return snapshot[columns]
+
+
+def paper_rrg_regime_frame(holdings: pd.DataFrame, snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate current holding value by stock-level RRG quadrant."""
+    columns = ["rrg_quadrant", "value", "weight"]
+    if holdings.empty or "symbol" not in holdings or "value" not in holdings:
+        return pd.DataFrame(columns=columns)
+
+    exposures = holdings[["symbol", "value"]].copy()
+    exposures["symbol"] = exposures["symbol"].astype(str).str.strip().str.upper()
+    exposures["value"] = pd.to_numeric(exposures["value"], errors="coerce").fillna(0.0)
+    if snapshot.empty or "symbol" not in snapshot or "rrg_quadrant" not in snapshot:
+        exposures["rrg_quadrant"] = "Unresolved"
+    else:
+        clean_snapshot = snapshot[["symbol", "rrg_quadrant"]].copy()
+        clean_snapshot["symbol"] = clean_snapshot["symbol"].astype(str).str.strip().str.upper()
+        exposures = exposures.merge(clean_snapshot, on="symbol", how="left")
+        exposures["rrg_quadrant"] = exposures["rrg_quadrant"].fillna("Unresolved")
+    exposures.loc[~exposures["rrg_quadrant"].isin(RRG_REGIME_ORDER), "rrg_quadrant"] = "Unresolved"
+
+    grouped = exposures.groupby("rrg_quadrant", as_index=False)["value"].sum()
+    ordered = pd.DataFrame({"rrg_quadrant": list(RRG_REGIME_ORDER)}).merge(grouped, on="rrg_quadrant", how="left")
+    ordered["value"] = ordered["value"].fillna(0.0)
+    total_value = float(ordered["value"].sum())
+    ordered["weight"] = ordered["value"] / total_value if total_value > 0 else 0.0
+    return ordered[columns]
+
+
+def _rrg_quadrant_weight(regime: pd.DataFrame, quadrants: set[str]) -> float:
+    if regime.empty or "rrg_quadrant" not in regime or "weight" not in regime:
+        return 0.0
+    return float(regime.loc[regime["rrg_quadrant"].isin(quadrants), "weight"].sum())
+
+
+def _largest_rrg_move(current: pd.DataFrame, previous: pd.DataFrame) -> tuple[str, float]:
+    merged = pd.DataFrame({"rrg_quadrant": list(RRG_REGIME_ORDER)}).merge(
+        current[["rrg_quadrant", "weight"]].rename(columns={"weight": "current_weight"}),
+        on="rrg_quadrant",
+        how="left",
+    ).merge(
+        previous[["rrg_quadrant", "weight"]].rename(columns={"weight": "previous_weight"}),
+        on="rrg_quadrant",
+        how="left",
+    )
+    merged[["current_weight", "previous_weight"]] = merged[["current_weight", "previous_weight"]].fillna(0.0)
+    merged["abs_delta"] = (merged["current_weight"] - merged["previous_weight"]).abs()
+    largest = merged.sort_values(["abs_delta", "rrg_quadrant"], ascending=[False, True]).iloc[0]
+    return str(largest["rrg_quadrant"]), float(largest["abs_delta"])
+
+
+def paper_rrg_regime_sentence(
+    current: pd.DataFrame,
+    previous: pd.DataFrame,
+    previous_date: object | None,
+) -> str:
+    """Return a deterministic one-line description of the portfolio's RRG rotation."""
+    if current.empty or float(pd.to_numeric(current.get("value", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) <= 0:
+        return "⚪ RRG regime is unresolved because the holdings or benchmark lack enough price history."
+
+    unresolved_weight = _rrg_quadrant_weight(current, {"Unresolved"})
+    if unresolved_weight >= 0.999:
+        return "⚪ RRG regime is unresolved because the holdings or benchmark lack enough price history."
+
+    if previous.empty or previous_date is None:
+        largest = current.sort_values(["weight", "rrg_quadrant"], ascending=[False, True]).iloc[0]
+        return f"➖ First RRG regime snapshot; largest sleeve is {largest['rrg_quadrant']} at {float(largest['weight']):.1%}."
+
+    previous_label = pd.to_datetime(previous_date).date().isoformat()
+    strength_delta = _rrg_quadrant_weight(current, RRG_STRENGTH_QUADRANTS) - _rrg_quadrant_weight(previous, RRG_STRENGTH_QUADRANTS)
+    weakness_delta = _rrg_quadrant_weight(current, RRG_WEAKNESS_QUADRANTS) - _rrg_quadrant_weight(previous, RRG_WEAKNESS_QUADRANTS)
+    strength_weight = _rrg_quadrant_weight(current, RRG_STRENGTH_QUADRANTS)
+    weakness_weight = _rrg_quadrant_weight(current, RRG_WEAKNESS_QUADRANTS)
+    threshold = 0.0005
+
+    if strength_delta > threshold and weakness_delta <= threshold:
+        return f"🟢 RRG improved since {previous_label}: Leading/Improving exposure rose by {strength_delta * 100:.1f} pts to {strength_weight:.1%}."
+    if weakness_delta > threshold and strength_delta <= threshold:
+        return f"🔴 RRG weakened since {previous_label}: Weakening/Lagging exposure rose by {weakness_delta * 100:.1f} pts to {weakness_weight:.1%}."
+
+    quadrant, largest_delta = _largest_rrg_move(current, previous)
+    if largest_delta > threshold:
+        return f"🟡 RRG rotation was mixed since {previous_label}: largest move was {quadrant} by {largest_delta * 100:.1f} pts."
+
+    largest = current.sort_values(["weight", "rrg_quadrant"], ascending=[False, True]).iloc[0]
+    return f"➖ No RRG regime change since {previous_label}; largest sleeve remains {largest['rrg_quadrant']} at {float(largest['weight']):.1%}."
+
+
+def paper_rrg_regime_analysis(
+    prices: pd.DataFrame,
+    holdings: pd.DataFrame,
+    benchmark: str,
+) -> tuple[pd.DataFrame, str]:
+    """Build current RRG exposure and its deterministic latest-vs-prior summary."""
+    if holdings.empty or prices.empty or "date" not in prices:
+        current = paper_rrg_regime_frame(holdings, pd.DataFrame())
+        return current, paper_rrg_regime_sentence(current, pd.DataFrame(), None)
+
+    symbols = holdings["symbol"].astype(str).str.strip().str.upper().tolist()
+    scoped = prices.copy()
+    scoped["symbol"] = scoped["symbol"].astype(str).str.strip().str.upper()
+    scoped["date"] = pd.to_datetime(scoped["date"], errors="coerce")
+    relevant_symbols = set(symbols) | {str(benchmark).strip().upper()}
+    available_dates = sorted(scoped.loc[scoped["symbol"].isin(relevant_symbols), "date"].dropna().unique())
+    latest_date = available_dates[-1] if available_dates else None
+    previous_date = available_dates[-2] if len(available_dates) > 1 else None
+
+    current_snapshot = paper_rrg_snapshot(scoped, symbols, benchmark, latest_date)
+    current = paper_rrg_regime_frame(holdings, current_snapshot)
+    previous = (
+        paper_rrg_regime_frame(holdings, paper_rrg_snapshot(scoped, symbols, benchmark, previous_date))
+        if previous_date is not None
+        else pd.DataFrame()
+    )
+    return current, paper_rrg_regime_sentence(current, previous, previous_date)
 
 
 BASKET_OVERLAY_COLOR = "#facc15"
@@ -969,6 +1548,31 @@ def rrg_seed_column_config() -> dict[str, object]:
     }
 
 
+def theme_breadth_column_config() -> dict[str, object]:
+    return {
+        "seed_universe": st.column_config.TextColumn("Theme", help="Fixed built-in seed universe used for this local breadth calculation."),
+        "date": st.column_config.DateColumn("As of", help="Latest Friday-ended weekly observation."),
+        "breadth": st.column_config.NumberColumn("Above 20D", help="Eligible constituents above their own 20-day SMA.", format="%.1f%%"),
+        "breadth_4w_average": st.column_config.NumberColumn("4W Avg", help="Simple average of the latest four weekly breadth readings.", format="%.1f%%"),
+        "breadth_change": st.column_config.NumberColumn("1W Change", help="Latest breadth minus the prior weekly reading.", format="%+.1f%%"),
+        "roc_50d": st.column_config.NumberColumn("50D ROC", help="50-trading-session percent change of the dashboard equal-weight theme index.", format="%+.1f%%"),
+        "confirmation": st.column_config.TextColumn("Confirmation", help="Agreement between breadth versus its 4W average and positive/negative 50D ROC."),
+        "coverage": st.column_config.NumberColumn("Coverage", help="Eligible constituents with sufficient 20D history divided by the fixed universe size.", format="%.0f%%"),
+        "eligible_count": st.column_config.NumberColumn("Eligible", help="Constituents with a valid close and 20D SMA at the observation date.", format="%d"),
+        "universe_size": st.column_config.NumberColumn("Universe", help="Fixed number of tickers in the current built-in seed CSV.", format="%d"),
+        "missing_or_short_history": st.column_config.NumberColumn("Unavailable", help="Constituents missing a valid close or enough 20D history at the observation date.", format="%d"),
+    }
+
+
+def theme_breadth_display(summary: pd.DataFrame) -> pd.DataFrame:
+    """Scale ratio-valued breadth fields for percent-formatted table columns."""
+    display = summary.copy()
+    for column in THEME_BREADTH_PERCENT_COLUMNS:
+        if column in display.columns:
+            display[column] = pd.to_numeric(display[column], errors="coerce") * 100.0
+    return display
+
+
 def portfolio_column_config() -> dict[str, object]:
     return {
         "weight": st.column_config.NumberColumn("Weight", help="Model portfolio target weight.", format="%.1f%%"),
@@ -1004,10 +1608,48 @@ def allocation_pie_chart(portfolio: pd.DataFrame, name_column: str, title: str) 
     if portfolio.empty or name_column not in portfolio.columns:
         fig.update_layout(title=title, height=360)
         return fig
-    grouped = portfolio.groupby(name_column, as_index=False)["weight"].sum()
+    grouped = portfolio.groupby(name_column, as_index=False, sort=False)["weight"].sum()
     fig.add_trace(go.Pie(labels=grouped[name_column], values=grouped["weight"], hole=0.45))
     fig.update_layout(title=title, height=360)
     return fig
+
+
+def portfolio_rrg_allocation_frame(applied_target: pd.DataFrame, rrg_history: pd.DataFrame) -> pd.DataFrame:
+    """Group applied non-cash allocation by each holding's latest stock-level RRG quadrant."""
+    columns = ["rrg_quadrant", "weight"]
+    if applied_target.empty or not {"symbol", "weight"}.issubset(applied_target.columns):
+        return pd.DataFrame(columns=columns)
+
+    holdings = applied_target[["symbol", "weight"]].copy()
+    holdings["symbol"] = holdings["symbol"].astype(str).str.strip().str.upper()
+    holdings["weight"] = pd.to_numeric(holdings["weight"], errors="coerce").fillna(0.0)
+    holdings = holdings[holdings["symbol"].ne("") & holdings["symbol"].ne("CASH") & holdings["weight"].gt(0)].copy()
+    if holdings.empty:
+        return pd.DataFrame(columns=columns)
+
+    if rrg_history.empty or not {"symbol", "date", "quadrant"}.issubset(rrg_history.columns):
+        latest = pd.DataFrame(columns=["symbol", "quadrant"])
+    else:
+        latest = rrg_history.copy()
+        latest["symbol"] = latest["symbol"].astype(str).str.strip().str.upper()
+        latest["date"] = pd.to_datetime(latest["date"], errors="coerce")
+        latest = (
+            latest[latest["symbol"].isin(holdings["symbol"])]
+            .dropna(subset=["date"])
+            .sort_values(["symbol", "date"])
+            .groupby("symbol", as_index=False)
+            .tail(1)[["symbol", "quadrant"]]
+        )
+
+    grouped = holdings.merge(latest, on="symbol", how="left")
+    grouped["rrg_quadrant"] = grouped["quadrant"].fillna("Unresolved")
+    grouped.loc[~grouped["rrg_quadrant"].isin(RRG_REGIME_ORDER), "rrg_quadrant"] = "Unresolved"
+    grouped = grouped.groupby("rrg_quadrant", as_index=False)["weight"].sum()
+    return (
+        pd.DataFrame({"rrg_quadrant": list(RRG_REGIME_ORDER)})
+        .merge(grouped, on="rrg_quadrant", how="left")
+        .fillna({"weight": 0.0})[columns]
+    )
 
 
 def symbol_from_dataframe_selection(event: object, ranked: pd.DataFrame) -> str | None:
@@ -1023,6 +1665,15 @@ def symbol_from_dataframe_selection(event: object, ranked: pd.DataFrame) -> str 
     if not isinstance(row_index, int) or row_index >= len(ranked):
         return None
     return str(ranked.iloc[row_index]["symbol"])
+
+
+def dashboard_view_after_pending_request(current_view: object, requested_view: object) -> str:
+    """Choose a valid dashboard view before its navigation widget is created."""
+    if requested_view in VIEW_OPTIONS:
+        return str(requested_view)
+    if current_view in VIEW_OPTIONS:
+        return str(current_view)
+    return "Rankings"
 
 
 def display_rankings(ranked: pd.DataFrame) -> object:
@@ -1077,10 +1728,17 @@ def main() -> None:
     larsson_history_weeks = st.sidebar.slider("Larsson history weeks", min_value=8, max_value=104, value=26, step=1)
     st.sidebar.subheader("Seed Universe")
     options = seed_universe_options()
+    # This runs before the widget is instantiated, so sessions that still hold
+    # the retired Mag7 + SpaceX value migrate without a stale-widget error.
+    st.session_state["seed_universe"] = seed_universe_label_after_migration(
+        st.session_state.get("seed_universe"), options
+    )
     seed_label = st.sidebar.selectbox(
         "Seed universe",
         options,
         index=options.index(DEFAULT_SEED_UNIVERSE),
+        format_func=seed_universe_display_name,
+        help="Choose the stock basket used for rankings and charts. The full universe name remains available after selection.",
     )
     active_seed = select_seed_universe(seed_label, seed_frames)
     default_text = "\n".join(active_seed["symbol"].tolist())
@@ -1097,8 +1755,10 @@ def main() -> None:
     # refresh path is used regardless of where the user starts it.
     refresh_clicked = sidebar_refresh_clicked or bool(st.session_state.pop("paper_portfolio_refresh_requested", False))
 
-    if st.session_state.get("dashboard_view") not in VIEW_OPTIONS:
-        st.session_state["dashboard_view"] = "Rankings"
+    requested_dashboard_view = st.session_state.pop("pending_dashboard_view", None)
+    st.session_state["dashboard_view"] = dashboard_view_after_pending_request(
+        st.session_state.get("dashboard_view"), requested_dashboard_view
+    )
     active_view = st.segmented_control(
         "Dashboard view",
         VIEW_OPTIONS,
@@ -1112,6 +1772,12 @@ def main() -> None:
         st.session_state.get("rrg_view", "Stocks"),
         st.session_state.get("rrg_seed_universes", default_rrg_seed_universes()),
     ) if active_view == "RRG" else []
+    if active_view == "Portfolio" and not st.session_state.get("_portfolio_seed_universes_all_default_migrated", False):
+        st.session_state["portfolio_seed_universes"] = portfolio_seed_universes_after_default_migration(
+            st.session_state.get("portfolio_seed_universes"),
+            seed_rrg_universe_options(),
+        )
+        st.session_state["_portfolio_seed_universes_all_default_migrated"] = True
     portfolio_data_enabled = bool(st.session_state.get("portfolio_data_enabled", False))
     portfolio_seed_labels_for_fetch = selected_portfolio_seed_labels_for_fetch(
         st.session_state.get("portfolio_seed_universes", default_portfolio_seed_universes()),
@@ -1119,12 +1785,12 @@ def main() -> None:
     ) if active_view == "Portfolio" else []
     rrg_seed_symbols = seed_symbols_for_labels(seed_frames, rrg_seed_labels)
     portfolio_seed_symbols = seed_symbols_for_labels(seed_frames, portfolio_seed_labels_for_fetch)
+    theme_breadth_symbols = seed_symbols_for_labels(seed_frames, seed_rrg_universe_options()) if active_view == "Theme Breadth" else []
     all_seed = all_seed_universe(seed_frames)
-    lab_uses_all_seeds = active_view == "Chatgptfolio Lab" and st.session_state.get("lab_candidate_universe", "All seed tickers") == "All seed tickers"
-    lab_symbols = set(all_seed["symbol"]) if lab_uses_all_seeds else set()
+    lab_symbols = set(all_seed["symbol"]) if active_view == "Chatgptfolio Lab" else set()
     paper_symbols = set(paper_valuation_symbols(db_path=DEFAULT_DB_PATH)) if active_view in {"Paper Portfolio", "Chatgptfolio Lab"} else set()
-    active_symbols = set(universe["symbol"]) if active_view not in {"Paper Portfolio", "System Health"} else set()
-    symbols = sorted(active_symbols.union(rrg_seed_symbols).union(portfolio_seed_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
+    active_symbols = set(universe["symbol"]) if active_view not in {"Paper Portfolio", "System Health", "Theme Breadth"} else set()
+    symbols = sorted(active_symbols.union(rrg_seed_symbols).union(portfolio_seed_symbols).union(theme_breadth_symbols).union(lab_symbols).union(paper_symbols).union({benchmark}))
     refresh_key = st.session_state.get("refresh_key", 0)
     if refresh_clicked:
         refresh_key += 1
@@ -1137,11 +1803,20 @@ def main() -> None:
         cached_before = cached_symbol_count(symbols, DEFAULT_DB_PATH)
         price_cache_state = session_cache_state("prices", (tuple(symbols), refresh_key, years))
         prices = cached_prices(tuple(symbols), refresh_key, refresh_clicked, years, str(DEFAULT_DB_PATH))
-        loaded_detail = "manual refresh" if refresh_clicked else ("warm local cache" if cached_before >= len(symbols) else f"loaded {max(0, len(symbols) - cached_before)} symbols")
+        missing_symbol_count = max(0, len(symbols) - cached_before)
+        loaded_detail = "manual refresh" if refresh_clicked else ("warm local cache" if missing_symbol_count == 0 else f"{missing_symbol_count} symbols missing from local cache")
         record_timing("Price cache", price_started_at, price_cache_state, loaded_detail)
     except RuntimeError as exc:
         st.error(str(exc))
         return
+
+    if not refresh_clicked:
+        cached_symbols = set(prices["symbol"].astype(str).str.upper()) if not prices.empty and "symbol" in prices else set()
+        missing_symbols = [symbol for symbol in symbols if symbol not in cached_symbols]
+        if missing_symbols:
+            preview = ", ".join(missing_symbols[:20])
+            suffix = "" if len(missing_symbols) <= 20 else f", and {len(missing_symbols) - 20} more"
+            st.warning(f"{len(missing_symbols)} requested symbols are not in the local price cache: {preview}{suffix}. Press Refresh cache to download market data.")
 
     if prices.empty:
         st.warning("No price data available yet. Refresh the cache after installing the required dependencies.")
@@ -1149,7 +1824,7 @@ def main() -> None:
 
     signals = pd.DataFrame()
     ranked = pd.DataFrame()
-    needs_primary_signals = active_view not in {"Chatgptfolio Lab", "Paper Portfolio", "System Health"}
+    needs_primary_signals = active_view not in {"Chatgptfolio Lab", "Paper Portfolio", "System Health", "Theme Breadth"}
     if needs_primary_signals:
         config = SignalConfig(larsson_history_weeks=larsson_history_weeks)
         active_signal_symbols = set(universe["symbol"]).union({benchmark})
@@ -1199,7 +1874,10 @@ def main() -> None:
         selected_from_table = symbol_from_dataframe_selection(ranking_event, ranked)
         if selected_from_table:
             st.session_state["detail_symbol"] = selected_from_table
-            st.session_state["dashboard_view"] = "Detail"
+            # The navigation widget has already been created this run. Defer
+            # changing its state until the next rerun to satisfy Streamlit's
+            # widget-state contract.
+            st.session_state["pending_dashboard_view"] = "Detail"
             st.rerun()
 
     elif active_view == "Detail":
@@ -1433,10 +2111,15 @@ def main() -> None:
                     )
         else:
             seed_options = seed_rrg_universe_options()
+            if not st.session_state.get("_rrg_seed_universes_all_default_migrated", False):
+                st.session_state["rrg_seed_universes"] = rrg_seed_universes_after_default_migration(
+                    st.session_state.get("rrg_seed_universes"),
+                    seed_options,
+                )
+                st.session_state["_rrg_seed_universes_all_default_migrated"] = True
             selected_seed_labels = st.multiselect(
                 "Seed universes",
                 seed_options,
-                default=default_rrg_seed_universes(),
                 key="rrg_seed_universes",
                 help="Built-in seed presets to compare as equal-weight basket dots.",
             )
@@ -1494,6 +2177,81 @@ def main() -> None:
                         column_config=rrg_seed_column_config(),
                     )
 
+    elif active_view == "Theme Breadth":
+        theme_options = seed_rrg_universe_options()
+        st.subheader("Theme Breadth")
+        st.caption(
+            "Local-only participation and momentum for every fixed built-in seed universe. "
+            "This is a dashboard equal-weight theme index, not Jordi Visser's/JV's index; it does not affect rankings or allocations."
+        )
+        st.caption(
+            f"Breadth is the Friday-ended percentage above each stock's {THEME_BREADTH_SMA_DAYS}D SMA; "
+            f"the line is a {THEME_BREADTH_SMOOTHING_WEEKS}-week average and ROC (Rate of Change) is {THEME_BREADTH_ROC_DAYS} trading sessions. "
+            f"A confirmation requires at least {THEME_BREADTH_MIN_COVERAGE:.0%} coverage."
+        )
+        theme_histories: dict[str, pd.DataFrame] = {}
+        theme_summaries: list[pd.DataFrame] = []
+        for label in theme_options:
+            theme_symbols = seed_symbols_for_labels(seed_frames, [label])
+            history = cached_theme_breadth_history(
+                prices_for_symbols(prices, set(theme_symbols)),
+                tuple(theme_symbols),
+            )
+            theme_histories[label] = history
+            theme_summaries.append(latest_theme_breadth_summary(history, label, len(theme_symbols)))
+
+        summary = pd.concat(theme_summaries, ignore_index=True) if theme_summaries else pd.DataFrame()
+        if summary.empty:
+            st.info("No cached theme data is available yet. Press Refresh cache to download the built-in theme universes.")
+        else:
+            summary["theme"] = summary["seed_universe"].map(seed_universe_display_name)
+            table_columns = [
+                "theme",
+                "date",
+                "breadth",
+                "breadth_4w_average",
+                "breadth_change",
+                "roc_50d",
+                "confirmation",
+                "coverage",
+                "eligible_count",
+                "universe_size",
+                "missing_or_short_history",
+            ]
+            display_summary = theme_breadth_display(
+                summary[[column for column in table_columns if column in summary.columns]].sort_values("theme")
+            )
+            table_config = theme_breadth_column_config()
+            table_config["theme"] = st.column_config.TextColumn("Theme", help="Fixed built-in seed universe used for this local breadth calculation.")
+            st.dataframe(display_summary, width="stretch", hide_index=True, column_config=table_config)
+
+            focused_theme = st.selectbox(
+                "Theme detail",
+                theme_options,
+                format_func=seed_universe_display_name,
+                key="theme_breadth_focus",
+                help="Choose one built-in universe for the two historical charts below.",
+            )
+            focused_history = theme_histories[focused_theme]
+            focused_summary = latest_theme_breadth_summary(
+                focused_history,
+                focused_theme,
+                len(seed_symbols_for_labels(seed_frames, [focused_theme])),
+            ).iloc[0]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Above 20D", pct(focused_summary.get("breadth")))
+            m2.metric("4W Breadth Average", pct(focused_summary.get("breadth_4w_average")))
+            m3.metric("Equal-Weight 50D ROC", pct(focused_summary.get("roc_50d")))
+            eligible_count = pd.to_numeric(pd.Series([focused_summary.get("eligible_count")]), errors="coerce").fillna(0).iloc[0]
+            universe_size = pd.to_numeric(pd.Series([focused_summary.get("universe_size")]), errors="coerce").fillna(0).iloc[0]
+            unavailable_count = pd.to_numeric(pd.Series([focused_summary.get("missing_or_short_history")]), errors="coerce").fillna(0).iloc[0]
+            coverage_detail = f"{int(eligible_count)} / {int(universe_size)} eligible"
+            m4.metric("Coverage", pct(focused_summary.get("coverage")), coverage_detail)
+            st.caption(f"**{focused_summary.get('confirmation', 'Unresolved')}** · {coverage_detail} · unavailable or short history: {int(unavailable_count)}")
+            chart_left, chart_right = st.columns(2)
+            chart_left.plotly_chart(theme_breadth_chart(focused_history, focused_theme), use_container_width=True)
+            chart_right.plotly_chart(theme_roc_chart(focused_history, focused_theme), use_container_width=True)
+
     elif active_view == "Portfolio":
         portfolio_seed_options = seed_rrg_universe_options()
         selected_portfolio_seeds = st.multiselect(
@@ -1504,16 +2262,17 @@ def main() -> None:
             help="Seed presets eligible for the model portfolio.",
         )
         pc1, pc2, pc3, pc4 = st.columns(4)
-        max_holdings = pc1.slider("Max holdings", min_value=4, max_value=25, value=12, step=1)
-        top_per_seed = pc2.slider("Top candidates per seed", min_value=2, max_value=10, value=5, step=1)
-        max_position_pct = pc3.slider("Max position", min_value=5, max_value=25, value=12, step=1)
-        max_seed_exposure_pct = pc4.slider("Max seed exposure", min_value=20, max_value=80, value=45, step=5)
+        max_holdings = pc1.slider("Max holdings", min_value=4, max_value=25, value=12, step=1, help="Maximum number of stocks the allocator may hold; cash can still be retained.")
+        top_per_seed = pc2.slider("Top candidates per seed", min_value=2, max_value=10, value=5, step=1, help="How many highest-ranked candidates each selected seed universe contributes to the allocation pool.")
+        max_position_pct = pc3.slider("Max position", min_value=5, max_value=25, value=12, step=1, help="Largest allowed weight for any individual stock after allocation.")
+        max_seed_exposure_pct = pc4.slider("Max seed exposure", min_value=20, max_value=80, value=45, step=5, help="Largest combined weight allowed for stocks from one seed universe.")
 
         pc5, pc6, pc7 = st.columns(3)
-        sensitivity = pc5.selectbox("Allocator sensitivity", list(SENSITIVITY_PROFILES), index=1)
-        use_portfolio_rs = pc6.checkbox("Use relative strength", value=True)
-        allow_weak_candidates = pc7.checkbox("Allow weak-regime candidates", value=False)
-        include_cash_rule = st.checkbox("Use benchmark-regime cash rule", value=True)
+        sensitivity = pc5.selectbox("Allocator sensitivity", list(SENSITIVITY_PROFILES), index=1, help="Controls how readily the allocator accepts portfolio changes: Conservative needs stronger evidence; Aggressive changes more readily.")
+        use_portfolio_rs = pc6.checkbox("Use relative strength", value=True, help="Blend each stock's relative performance versus the selected benchmark into its ranking score.")
+        allow_weak_candidates = pc7.checkbox("Allow weak-regime candidates", value=False, help="Include candidates whose Larsson-proxy regime is Bear. By default, those candidates are excluded.")
+        include_cash_rule = st.checkbox("Use benchmark-regime cash rule", value=True, help="Reserve at least 15% cash in a Transition benchmark regime and 35% in a Bear regime. Turn this off to target no regime-driven cash reserve.")
+        st.caption(benchmark_regime_cash_rule_status(benchmark_regime, include_cash_rule))
 
         portfolio_config = PortfolioConfig(
             selected_seeds=tuple(selected_portfolio_seeds),
@@ -1586,6 +2345,23 @@ def main() -> None:
             latest_portfolio, latest_metadata = load_latest_portfolio_snapshot(DEFAULT_DB_PATH)
             applied_target = apply_sensitivity_to_target(previous_portfolio, raw_target, portfolio_config)
             changes, suppressed = compare_portfolios(previous_portfolio, raw_target, portfolio_config)
+            portfolio_holding_symbols = (
+                applied_target.loc[applied_target["symbol"].astype(str).str.upper() != "CASH", "symbol"]
+                .astype(str)
+                .str.upper()
+                .tolist()
+                if not applied_target.empty and "symbol" in applied_target.columns
+                else []
+            )
+            stock_rrg_history = cached_rrg_history(
+                portfolio_prices,
+                tuple(portfolio_holding_symbols),
+                benchmark,
+                RRGConfig().ratio_window_weeks,
+                RRGConfig().momentum_window_weeks,
+                RRGConfig().tail_weeks,
+            ) if portfolio_holding_symbols else pd.DataFrame()
+            stock_rrg_allocation = portfolio_rrg_allocation_frame(applied_target, stock_rrg_history)
 
             p1, p2, p3, p4 = st.columns(4)
             p1.metric("Holdings", int((applied_target["symbol"] != "Cash").sum()) if not applied_target.empty else 0)
@@ -1621,9 +2397,10 @@ def main() -> None:
                 column_config=portfolio_column_config(),
             )
 
-            cc1, cc2 = st.columns(2)
+            cc1, cc2, cc3 = st.columns(3)
             cc1.plotly_chart(allocation_pie_chart(applied_target, "symbol", "Allocation by Holding"), use_container_width=True)
             cc2.plotly_chart(allocation_pie_chart(applied_target, "seed_universe", "Allocation by Seed Universe"), use_container_width=True)
+            cc3.plotly_chart(allocation_pie_chart(stock_rrg_allocation, "rrg_quadrant", "Allocation by Stock RRG Quadrant"), use_container_width=True)
 
             st.subheader("Changes Since Matching Baseline")
             change_display = changes.copy()
@@ -1671,7 +2448,6 @@ def main() -> None:
     elif active_view == "Chatgptfolio Lab":
         st.title("Chatgptfolio Lab")
         st.caption("Auditable OpenAI research and paper trading. This does not place real trades or provide investment advice.")
-        paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
         lab_candidate_universe = st.radio("Candidate universe", ["All seed tickers", "Current selected seed"], horizontal=True, key="lab_candidate_universe", help="All seed tickers technically ranks the deduplicated union before research is bounded to the top 30.")
         lab_universe = all_seed if lab_candidate_universe == "All seed tickers" else universe
         lab_signal_prices = prices_for_symbols(prices, set(lab_universe["symbol"]).union({benchmark}))
@@ -1695,14 +2471,22 @@ def main() -> None:
         lab_ranked["rank"] = range(1, len(lab_ranked) + 1)
         lab_candidates = lab_ranked.head(30).copy()
         lab_state = st.session_state.get("lab_state", {})
-        lab_held_symbols = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH).get("symbol", pd.Series(dtype=str)).astype(str).str.upper().tolist()
+        # Every approved proposal starts an isolated experiment, so no prior
+        # experiment's positions are inputs to a new model decision.
+        lab_held_symbols: list[str] = []
 
         st.subheader("1. Run setup")
         lc1, lc2, lc3, lc4 = st.columns(4)
         selected_model = lc1.selectbox("OpenAI model", MODEL_OPTIONS, index=MODEL_OPTIONS.index(DEFAULT_MODEL), help="Model choice is recorded per run; there is no automatic fallback.")
         as_of_date = date.today()
+        lab_theme_breadth = theme_breadth_packet_rows(
+            prices_for_symbols(prices, set(all_seed["symbol"])),
+            seed_frames,
+            as_of_date,
+        )
         lc2.metric("Research date", as_of_date.isoformat(), help="Live Lab decisions are current-date research only. Historical replay stays disabled until every source has an archived point-in-time packet.")
-        paper_capital = lc3.number_input("Paper capital ($)", min_value=1_000.0, value=100_000.0, step=10_000.0)
+        paper_capital = 100_000.0
+        lc3.metric("Experiment capital", money(paper_capital), help="Every approved run opens a separate, independent paper experiment at this nominal capital.")
         slippage_bps = lc4.number_input("Slippage (bps)", min_value=0.0, value=5.0, step=1.0)
         lc5, lc6, lc7 = st.columns(3)
         lab_max_holdings = lc5.slider("Maximum holdings", 1, 15, 12)
@@ -1710,7 +2494,7 @@ def main() -> None:
         commission_bps = lc7.number_input("Commission (bps)", min_value=0.0, value=0.0, step=0.5)
         lc8, lc9 = st.columns(2)
         lab_max_sector = lc8.slider("Maximum sector exposure (%)", 10, 80, 40, step=5) / 100
-        refresh_research = lc9.checkbox("Refresh public research evidence", value=True, help="Fetches bounded SEC, FRED, and curated-news evidence only when an analysis is run.")
+        refresh_research = lc9.checkbox("Refresh SEC, FRED, and filing evidence", value=True, help="Refreshes the broader public research packet when an analysis is run. Recent ticker news is always refreshed for an analysis.")
         lab_config = LabConfig(model=selected_model, max_holdings=lab_max_holdings, max_position=lab_max_position, max_sector_exposure=lab_max_sector, paper_capital=paper_capital, slippage_bps=slippage_bps, commission_bps=commission_bps)
 
         st.subheader("Connection & Data Health")
@@ -1718,10 +2502,10 @@ def main() -> None:
         credential = credential_status(last_model_error)
         health_one, health_two, health_three = st.columns(3)
         health_one.metric("OpenAI credential", credential.title())
-        cached_all_seed_count = cached_symbol_count(all_seed["symbol"], DEFAULT_DB_PATH) if lab_candidate_universe == "All seed tickers" else 0
-        health_two.metric("All-seeds cache", f"{cached_all_seed_count}/{len(all_seed)} tickers" if lab_candidate_universe == "All seed tickers" else "Focused seed")
+        cached_all_seed_count = cached_symbol_count(all_seed["symbol"], DEFAULT_DB_PATH)
+        health_two.metric("All-seeds cache", f"{cached_all_seed_count}/{len(all_seed)} tickers")
         health_three.metric("Price cache", latest_cache_timestamp(DEFAULT_DB_PATH))
-        if lab_candidate_universe == "All seed tickers":
+        if cached_all_seed_count < len(all_seed):
             st.caption("First all-seeds load may take longer; subsequent runs reuse the local DuckDB price cache.")
         if credential == "missing":
             st.warning("No credential is available to the app. The key is never displayed or stored in DuckDB.")
@@ -1729,7 +2513,7 @@ def main() -> None:
             st.error("The last OpenAI request was rejected. Replace the credential, then rerun; the key is never displayed here.")
 
         st.subheader("2. Research packet")
-        packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False, prices=lab_signal_prices, held_symbols=lab_held_symbols)
+        packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=False, prices=lab_signal_prices, held_symbols=lab_held_symbols, theme_breadth=lab_theme_breadth)
         display_packet = lab_state.get("packet", packet)
         source_status, coverage_status, candidate_status = st.columns(3)
         source_status.metric("Price source", display_packet["coverage"]["prices"].title())
@@ -1737,6 +2521,11 @@ def main() -> None:
         candidate_status.metric("Candidates", len(lab_candidates))
         st.caption(f"{len(lab_ranked)} technically eligible tickers were ranked; only the top {len(lab_candidates)} enter the bounded research packet. Missing sources remain explicit and are never filled by model inference.")
         st.subheader("Research Overview")
+        context = packet_context_metadata(display_packet, lab_config, lab_state.get("api_usage"))
+        context_one, context_two, context_three = st.columns(3)
+        context_one.metric("Estimated GPT input", f"{int(context['estimated_input_tokens']):,} tokens")
+        context_two.metric("Packet reduction", f"{float(context['estimated_packet_reduction_pct']):.0f}%")
+        context_three.metric("Seed breadth", f"{int(context['theme_breadth_count'])} themes")
         health = evidence_health(display_packet)
         severity_dot_strip(health, "Evidence health")
         st.dataframe(pd.DataFrame(health), width="stretch", hide_index=True)
@@ -1744,6 +2533,20 @@ def main() -> None:
         if macro.get("series"):
             st.caption(f"Macro regime: **{macro.get('regime', 'unavailable')}**")
             st.dataframe(pd.DataFrame(macro["series"]).T, width="stretch", hide_index=False)
+        breadth_preview = pd.DataFrame(display_packet.get("theme_breadth", []))
+        if not breadth_preview.empty:
+            breadth_columns = [
+                "seed_universe", "observation_date", "breadth", "breadth_4w_average",
+                "breadth_change", "roc_50d", "confirmation", "coverage",
+                "eligible_count", "universe_size",
+            ]
+            st.caption("Latest fixed-seed breadth supplied to GPT as advisory context.")
+            st.dataframe(
+                theme_breadth_display(breadth_preview[[column for column in breadth_columns if column in breadth_preview]]),
+                width="stretch",
+                hide_index=True,
+                column_config=theme_breadth_column_config(),
+            )
         correlation_preview = display_packet.get("correlations", {})
         if correlation_preview:
             st.caption(f"Correlation coverage: {correlation_preview.get('daily_window', 50)} trading days / {correlation_preview.get('weekly_window', 26)} weeks. High-pair threshold: 0.80.")
@@ -1753,6 +2556,8 @@ def main() -> None:
                 st.dataframe(high_pairs, width="stretch", hide_index=True)
         with st.expander("Immutable packet audit (raw JSON)"):
             st.json(display_packet)
+        with st.expander("Compact packet sent to GPT"):
+            st.json(compact_model_packet(display_packet))
 
         st.subheader("3. Candidate review")
         review = lab_ranked.copy()
@@ -1766,7 +2571,7 @@ def main() -> None:
 
         if st.button("Run ChatGPT paper-portfolio analysis", type="primary"):
             research_started_at = perf_counter()
-            packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research, prices=lab_signal_prices, held_symbols=lab_held_symbols)
+            packet = research_packet(lab_candidates, as_of_date, benchmark, lab_config, refresh_research=refresh_research, refresh_news=True, prices=lab_signal_prices, held_symbols=lab_held_symbols, theme_breadth=lab_theme_breadth)
             record_timing("Research collection", research_started_at, "live refresh" if refresh_research else "packet-only", f"{len(packet.get('evidence', []))} evidence records")
             for source, duration_ms in packet.get("connector_timings_ms", {}).items():
                 record_duration(f"{str(source).title()} connector", float(duration_ms), "sequential public source", str(packet.get("coverage", {}).get(source, "unknown")))
@@ -1785,9 +2590,9 @@ def main() -> None:
                 return
             try:
                 model_started_at = perf_counter()
-                model_decision, raw_response, returned_model = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
+                model_decision, raw_response, returned_model, api_usage = OpenAIPortfolioModel(selected_model).decide(packet, lab_config)
                 record_timing("OpenAI proposal", model_started_at, "live API", selected_model)
-                previous_weights = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)
+                previous_weights = pd.DataFrame(columns=["symbol", "weight"])
                 decision = optimize_decision(model_decision, lab_candidates, lab_config, previous_weights)
                 validation = validate_decision(decision, lab_candidates, lab_config, previous_weights, packet=packet)
                 status = "proposal_ready" if validation.valid else "validation_failed"
@@ -1798,16 +2603,20 @@ def main() -> None:
                     "returned_model": returned_model,
                     "status": status,
                     "packet_hash": packet_hash,
-                    "prompt_hash": decision_hash({"packet": packet, "config": lab_config_payload(lab_config)}),
+                    "prompt_hash": decision_hash({
+                        "prompt": prompt_for_packet(packet, lab_config),
+                        "schema": decision_schema_for_packet(packet),
+                        "model": selected_model,
+                    }),
                     "config_json": json.dumps(lab_config_payload(lab_config)),
                     "request_settings_json": json.dumps({"reasoning_effort": "high" if selected_model == DEFAULT_MODEL else "medium", "response_format": "strict_json_schema"}),
-                    "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config)),
+                    "context_metadata_json": json.dumps(packet_context_metadata(packet, lab_config, api_usage)),
                     "response_json": json.dumps({"model_decision": model_decision, "optimized_decision": decision}),
                     "raw_response": raw_response,
                     "validation_json": json.dumps({"valid": validation.valid, "errors": validation.errors, "warnings": validation.warnings}),
                 }, DEFAULT_DB_PATH)
                 st.session_state.pop("lab_credential_error", None)
-                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model, "packet": packet, "config": lab_config_payload(lab_config), "as_of_date": as_of_date.isoformat()}
+                st.session_state["lab_state"] = {"run_id": run_id, "decision": decision, "validation": validation, "model": selected_model, "packet": packet, "config": lab_config_payload(lab_config), "as_of_date": as_of_date.isoformat(), "api_usage": api_usage}
                 st.rerun()
             except Exception as exc:
                 st.session_state["lab_credential_error"] = str(exc)
@@ -1824,6 +2633,14 @@ def main() -> None:
             state1.metric("Model", lab_state["model"])
             state2.metric("Validation", "Ready" if validation.valid else "Failed")
             state3.metric("Run ID", lab_state["run_id"])
+            usage = lab_state.get("api_usage", {})
+            if usage:
+                st.caption(
+                    f"API tokens: {int(usage.get('input_tokens', 0)):,} input · "
+                    f"{int(usage.get('cached_input_tokens', 0)):,} cached input · "
+                    f"{int(usage.get('output_tokens', 0)):,} output · "
+                    f"{int(usage.get('reasoning_tokens', 0)):,} reasoning"
+                )
             if validation.valid:
                 st.success("Proposal passed deterministic limits. Review before approving paper orders.")
             else:
@@ -1888,7 +2705,7 @@ def main() -> None:
                         st.dataframe(rows[[column for column in ["category", "title", "publisher", "source_tier", "source_domain", "published_at", "status", "source_url"] if column in rows]], width="stretch", hide_index=True)
 
             st.subheader("5. Paper rebalance")
-            prior_weights = paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)
+            prior_weights = pd.DataFrame(columns=["symbol", "weight"])
             orders = paper_orders(prior_weights, decision, lab_config)
             if orders.empty:
                 st.info("No paper orders proposed.")
@@ -1900,9 +2717,9 @@ def main() -> None:
                 if validation.valid and st.button("Approve paper rebalance", type="primary"):
                     rebalance_id = approve_paper_rebalance(
                         int(lab_state["run_id"]), decision, lab_state.get("config", lab_config_payload(lab_config)),
-                        date.fromisoformat(lab_state.get("as_of_date", as_of_date.isoformat())), paper_id, DEFAULT_DB_PATH,
+                        date.fromisoformat(lab_state.get("as_of_date", as_of_date.isoformat())), db_path=DEFAULT_DB_PATH,
                     )
-                    st.success(f"Paper rebalance #{rebalance_id} approved. It will fill at the next cached market open; no broker was contacted.")
+                    st.success(f"Independent $100,000 experiment approved (rebalance #{rebalance_id}). It will fill at the next cached market open; no broker was contacted.")
 
             with st.expander("Decision audit"):
                 st.json(decision)
@@ -1924,65 +2741,161 @@ def main() -> None:
 
     elif active_view == "Paper Portfolio":
         st.title("Paper Portfolio")
-        st.caption("One approved, paper-only portfolio. Proposals do not affect it until you explicitly approve a rebalance.")
+        st.caption("Every approved proposal creates an isolated $100,000 paper experiment. No experiment shares cash, positions, fills, or NAV with another.")
         if st.button("Refresh market data", icon=":material/refresh:", help="Fetch current prices for the paper holdings and benchmarks, then process any eligible pending paper rebalance."):
             st.session_state["paper_portfolio_refresh_requested"] = True
             st.rerun()
-        paper_id = default_paper_portfolio(db_path=DEFAULT_DB_PATH)
         valuation_started_at = perf_counter()
         completed_rebalances = execute_pending_paper_rebalances(prices, DEFAULT_DB_PATH)
-        rebuild_paper_nav(prices, paper_id, DEFAULT_DB_PATH, force=bool(completed_rebalances))
+        experiments = load_paper_experiments(DEFAULT_DB_PATH)
+        for portfolio_id in experiments.get("portfolio_id", pd.Series(dtype=int)).tolist():
+            rebuild_paper_nav(prices, int(portfolio_id), DEFAULT_DB_PATH, force=bool(completed_rebalances))
         record_timing(
             "Paper NAV refresh", valuation_started_at,
             "rebuilt after fill" if completed_rebalances else "valuation fingerprint reused when unchanged",
             f"{len(completed_rebalances)} new fills",
         )
-        nav, benchmarks, rebalances, positions = load_paper_portfolio_dashboard(paper_id, DEFAULT_DB_PATH)
-        executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
-        pending = rebalances[rebalances["status"] == "pending"] if not rebalances.empty else rebalances
-        if nav.empty:
-            st.info("No approved rebalance has filled yet. Approve a validated Lab proposal; it will become active at the next cached market open.")
-            if not pending.empty:
-                st.dataframe(pending[[column for column in ["rebalance_id", "run_id", "approved_at", "status", "note"] if column in pending]], width="stretch", hide_index=True)
+        experiments = load_paper_experiments(DEFAULT_DB_PATH)
+        st.subheader("Experiments")
+        if experiments.empty:
+            st.info("No independent experiment exists yet. Approve a validated Lab proposal to create one; it will remain pending until its next cached market open.")
         else:
-            start_nav, latest_nav = float(nav.iloc[0]["nav"]), float(nav.iloc[-1]["nav"])
-            daily_returns = nav["nav"].pct_change().dropna()
-            turnover = float(nav["turnover"].sum())
+            experiment_table = experiments.copy()
+            experiment_table["pending_state"] = experiment_table["has_pending"].map(lambda pending: "Pending next open" if pending else "Filled")
+            experiment_table["return"] = experiment_table["return"].map(pct)
+            experiment_table["drawdown"] = experiment_table["drawdown"].map(pct)
+            experiment_table["nav"] = experiment_table["nav"].map(money)
+            experiment_table = experiment_table.rename(columns={"name": "experiment", "sensitivity": "sensitivity", "basket_description": "basket"})
+            st.dataframe(
+                experiment_table[[column for column in ["experiment", "sensitivity", "basket", "model", "run_id", "status", "approval_date", "fill_date", "nav", "return", "drawdown", "holding_count", "pending_state"] if column in experiment_table]],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "experiment": st.column_config.TextColumn("Experiment"),
+                    "sensitivity": st.column_config.TextColumn("Sensitivity", help="Frozen turnover sensitivity from the approved Lab run."),
+                    "basket": st.column_config.TextColumn("Basket", help="Brief summary of the largest themes in the approved holdings."),
+                },
+            )
+
+            experiment_options = experiments["portfolio_id"].astype(int).tolist()
+            experiment_names = {
+                int(row["portfolio_id"]): paper_experiment_display_name(row)
+                for _, row in experiments.iterrows()
+            }
+            selected_experiments = st.multiselect(
+                "Compare active experiments",
+                experiment_options,
+                default=experiment_options,
+                format_func=lambda portfolio_id: experiment_names[int(portfolio_id)],
+                help="Each experiment is normalized to its own $100,000 start. Shared market references use the earliest selected filled experiment.",
+            )
+            selected_summary = experiments[experiments["portfolio_id"].isin(selected_experiments)]
+            comparison_warning = paper_comparison_start_warning(selected_summary)
+            if comparison_warning:
+                st.warning(comparison_warning)
+            if not selected_experiments:
+                st.info("Select one or more experiments to compare their performance.")
+            else:
+                comparison = go.Figure()
+                plotted = False
+                comparison_dashboards: dict[int, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+                for portfolio_id in selected_experiments:
+                    nav, benchmarks, rebalances, _ = load_paper_portfolio_dashboard(int(portfolio_id), DEFAULT_DB_PATH)
+                    comparison_dashboards[int(portfolio_id)] = (nav, benchmarks, rebalances)
+                    normalized_nav = normalize_paper_series(nav)
+                    if normalized_nav.empty:
+                        continue
+                    experiment_name = experiment_names[int(portfolio_id)]
+                    comparison.add_trace(go.Scatter(x=normalized_nav["date"], y=normalized_nav["normalized_nav"], name=experiment_name, line={"width": 3}))
+                    plotted = True
+                    executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
+                    if not executed.empty:
+                        markers = normalized_nav.merge(executed[["effective_date", "rebalance_id"]], left_on="date", right_on="effective_date", how="inner")
+                        if not markers.empty:
+                            comparison.add_trace(go.Scatter(x=markers["date"], y=markers["normalized_nav"], mode="markers", name=f"{experiment_name} fill", marker={"size": 9, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
+                benchmark_anchor_id = paper_comparison_benchmark_anchor(selected_summary)
+                if benchmark_anchor_id is not None and benchmark_anchor_id in comparison_dashboards:
+                    _, anchor_benchmarks, _ = comparison_dashboards[benchmark_anchor_id]
+                    for symbol, normalized_benchmark in shared_market_benchmark_series(anchor_benchmarks).items():
+                        comparison.add_trace(go.Scatter(x=normalized_benchmark["date"], y=normalized_benchmark["normalized_nav"], name=symbol, line={"width": 1.25, "dash": "dot"}, visible=paper_chart_trace_visibility(symbol)))
+                if plotted:
+                    comparison.update_layout(height=460, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Normalized value ($100,000 start)")
+                    st.plotly_chart(comparison, use_container_width=True, config={"displayModeBar": False})
+                    if benchmark_anchor_id is not None:
+                        anchor = selected_summary[selected_summary["portfolio_id"] == benchmark_anchor_id].iloc[0]
+                        anchor_date = pd.to_datetime(anchor["fill_date"]).date().isoformat()
+                        st.caption(f"Shared SPY, QQQ, GLD, and BTC-USD references are anchored to {experiment_names[benchmark_anchor_id]}'s {anchor_date} fill. TECHNICAL is run-specific and appears only in Experiment detail.")
+                    else:
+                        st.caption("Shared market references begin once a selected experiment has filled. TECHNICAL is run-specific and appears only in Experiment detail.")
+                else:
+                    st.info("The selected experiments are pending. Their comparison series will begin at the eligible cached market open.")
+
+            selected_detail_id = st.selectbox(
+                "Experiment detail",
+                experiment_options,
+                format_func=lambda portfolio_id: experiment_names[int(portfolio_id)],
+            )
+            detail = experiments[experiments["portfolio_id"] == selected_detail_id].iloc[0]
+            nav, benchmarks, rebalances, positions = load_paper_portfolio_dashboard(int(selected_detail_id), DEFAULT_DB_PATH)
+            fills = load_paper_fills(int(selected_detail_id), DEFAULT_DB_PATH)
+            executed = rebalances[rebalances["status"] == "executed"] if not rebalances.empty else rebalances
+            pending = rebalances[rebalances["status"] == "pending"] if not rebalances.empty else rebalances
+            st.subheader(experiment_names[int(selected_detail_id)])
+            st.caption("The sensitivity and basket description are derived from this experiment's frozen approval; the run ID, decision, and audit packet remain unchanged.")
             metric_one, metric_two, metric_three, metric_four = st.columns(4)
-            metric_one.metric("NAV", money(latest_nav), pct(latest_nav / start_nav - 1.0))
-            metric_two.metric("Max drawdown", pct(float(nav["drawdown"].min())))
-            metric_three.metric("Approved periods", len(executed))
-            metric_four.metric("Daily hit rate", pct(float((daily_returns > 0).mean())) if not daily_returns.empty else "n/a")
-            if len(executed) < 3:
-                st.warning("Insufficient history: fewer than three approved rebalance periods. This dashboard makes no outperformance claim from a short sample.")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=nav["date"], y=nav["nav"], name="Chatgptfolio paper", line={"width": 3, "color": "#2563eb"}))
-            if not benchmarks.empty:
-                for symbol, rows in benchmarks.groupby("symbol"):
-                    fig.add_trace(go.Scatter(x=rows["date"], y=rows["nav"], name=str(symbol), line={"width": 1.5}))
-            if not executed.empty:
-                markers = nav.merge(executed[["effective_date", "rebalance_id"]], left_on="date", right_on="effective_date", how="inner")
-                if not markers.empty:
-                    fig.add_trace(go.Scatter(x=markers["date"], y=markers["nav"], mode="markers", name="Approved update", marker={"size": 10, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
-            fig.update_layout(height=430, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Portfolio value")
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            summary_one, summary_two, summary_three, summary_four = st.columns(4)
-            summary_one.metric("Turnover", pct(turnover))
-            summary_two.metric("Average holding period", f"{max(0, len(nav) // max(1, len(executed)))} market days")
-            summary_three.metric("Concentration", pct(float((paper_portfolio_weights(prices, paper_id, DEFAULT_DB_PATH)["weight"] ** 2).sum())) if not positions.empty else "n/a")
-            source_health = load_source_health(DEFAULT_DB_PATH)
-            summary_four.metric("Source coverage", pct(float((source_health["status"] == "available").mean())) if not source_health.empty else "n/a")
-            st.caption("TECHNICAL is an equal-weight, deterministic baseline rebuilt from each approved run's frozen technical ranking. It uses the same rebalance dates but no model reasoning.")
-        st.subheader("Current positions and cash")
-        if positions.empty:
-            st.info("No filled positions yet.")
-        else:
-            st.dataframe(positions, width="stretch", hide_index=True)
-        st.subheader("Approved rebalance timeline")
-        if rebalances.empty:
-            st.info("No approvals recorded.")
-        else:
-            st.dataframe(rebalances[[column for column in ["rebalance_id", "run_id", "approved_at", "effective_date", "status", "starting_nav", "ending_cash", "model", "packet_hash", "note"] if column in rebalances]], width="stretch", hide_index=True)
+            metric_one.metric("NAV", money(detail["nav"]), pct(detail["return"]))
+            metric_two.metric("Max drawdown", pct(detail["drawdown"]))
+            metric_three.metric("Holdings", str(int(detail["holding_count"])))
+            metric_four.metric("State", "Pending next open" if bool(detail["has_pending"]) else "Filled")
+            paper_holdings = paper_holding_display_frame(positions, prices, all_seed)
+            if not paper_holdings.empty:
+                paper_rrg_regime, paper_rrg_sentence = paper_rrg_regime_analysis(prices, paper_holdings, benchmark)
+                allocation_column, rrg_column = st.columns(2)
+                allocation_column.plotly_chart(
+                    paper_value_pie_chart(paper_holdings, "label", "value", "Current holdings by ticker"),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+                rrg_column.plotly_chart(
+                    paper_value_pie_chart(paper_rrg_regime, "rrg_quadrant", "value", "Current RRG regime"),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+                st.caption(paper_rrg_sentence)
+            if nav.empty:
+                st.info("This experiment has not filled yet. Its frozen decision will remain pending until every required holding has a cached opening price after the research date.")
+                if not pending.empty:
+                    st.dataframe(pending[[column for column in ["rebalance_id", "run_id", "approved_at", "status", "note"] if column in pending]], width="stretch", hide_index=True)
+            else:
+                detail_chart = go.Figure()
+                normalized_nav = normalize_paper_series(nav)
+                detail_chart.add_trace(go.Scatter(x=normalized_nav["date"], y=normalized_nav["normalized_nav"], name="Experiment", line={"width": 3, "color": "#2563eb"}))
+                for symbol, benchmark_rows in benchmarks.groupby("symbol") if not benchmarks.empty else []:
+                    normalized_benchmark = normalize_paper_series(benchmark_rows)
+                    if not normalized_benchmark.empty:
+                        detail_chart.add_trace(go.Scatter(x=normalized_benchmark["date"], y=normalized_benchmark["normalized_nav"], name=str(symbol), line={"width": 1.5}, visible=paper_chart_trace_visibility(symbol)))
+                if not executed.empty:
+                    markers = normalized_nav.merge(executed[["effective_date", "rebalance_id"]], left_on="date", right_on="effective_date", how="inner")
+                    if not markers.empty:
+                        detail_chart.add_trace(go.Scatter(x=markers["date"], y=markers["normalized_nav"], mode="markers", name="Fill", marker={"size": 10, "symbol": "diamond", "color": "#f97316"}, text=[f"Rebalance #{value}" for value in markers["rebalance_id"]]))
+                detail_chart.update_layout(height=430, margin={"l": 10, "r": 10, "t": 25, "b": 10}, yaxis_title="Normalized value ($100,000 start)")
+                st.plotly_chart(detail_chart, use_container_width=True, config={"displayModeBar": False})
+            st.subheader("Current holdings")
+            if positions.empty:
+                st.info("No filled positions yet.")
+            else:
+                st.dataframe(positions, width="stretch", hide_index=True)
+            st.subheader("Fill audit trail")
+            if fills.empty:
+                st.info("No fills recorded yet.")
+            else:
+                st.dataframe(fills, width="stretch", hide_index=True)
+            st.subheader("Rebalance timeline and frozen evidence")
+            if rebalances.empty:
+                st.info("No approvals recorded.")
+            else:
+                st.caption(f"Evidence / run link: Chatgptfolio Lab run #{int(detail['run_id'])}; frozen packet {str(rebalances.iloc[0].get('packet_hash', 'unavailable'))[:16]}…")
+                st.dataframe(rebalances[[column for column in ["rebalance_id", "run_id", "approved_at", "effective_date", "status", "starting_nav", "ending_cash", "model", "packet_hash", "note"] if column in rebalances]], width="stretch", hide_index=True)
 
     elif active_view == "System Health":
         st.title("System Health")
